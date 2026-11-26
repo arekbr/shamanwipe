@@ -1,0 +1,46 @@
+#!/bin/sh
+# debootstrap wrapper for builds under Rosetta (Colima vz, amd64 container on Apple Silicon).
+# Why:
+#   1) Rosetta needs /proc/self/exe in the chroot; debootstrap runs `chroot TARGET /bin/true` before it mounts /proc.
+#   2) Inside Docker, debootstrap 1.0.141 does not mount /proc but creates a symlink TARGET/proc -> /proc, which INSIDE
+#      the chroot points to itself -> "rosetta error: Unable to open /proc/self/exe: 40" (ELOOP). Confirmed by test:
+#      after replacing the symlink with a directory + procfs the chroot works.
+# What it does: stage 1 --foreign; symlink proc -> directory; mount procfs; stage 2 --second-stage. Download-only is passed through unchanged.
+# Requires: build-in-container.sh removes /.dockerenv so that stage 2 does not recreate the symlink.
+# Rollback: remove /usr/local/sbin/debootstrap in the container - the original is used then.
+set -e
+REAL=/usr/sbin/debootstrap
+
+for a in "$@"; do
+  [ "$a" = "--download-only" ] && exec "$REAL" "$@"
+done
+
+# TARGET = second positional argument (SUITE TARGET [MIRROR [SCRIPT]])
+n=0; TARGET=
+for a in "$@"; do
+  case "$a" in -*) continue ;; esac
+  n=$((n + 1))
+  [ "$n" -eq 2 ] && TARGET="$a" && break
+done
+[ -n "$TARGET" ] || { echo "debootstrap-rosetta: TARGET not found in: $*" >&2; exit 2; }
+
+"$REAL" --foreign "$@"
+if [ -L "$TARGET/proc" ]; then rm -f "$TARGET/proc"; fi
+mkdir -p "$TARGET/proc"
+mount -t proc proc "$TARGET/proc"
+rc=0
+# Stage 2 FROM OUTSIDE (--second-stage-target): debootstrap's setup_proc() unmounts /proc and mounts it again with the
+# mount program - run inside the chroot under Rosetta that would no longer start (/sbin/ldconfig fails).
+DEBOOTSTRAP_DIR="$TARGET/debootstrap" "$REAL" --second-stage --second-stage-target "$TARGET" || rc=$?
+# Clean up ALL mounts under TARGET (proc, sys, dev/pts, ...), deepest first - stage 2 from outside leaves sysfs behind,
+# and live-build then runs `cp -a chroot cache/bootstrap` (which fails with: cp: chroot/sys/... Permission denied).
+T_ABS="$(readlink -f "$TARGET")"
+for i in 1 2 3; do
+  awk -v t="$T_ABS/" 'index($2, t) == 1 {print $2}' /proc/mounts | sort -r | while read -r m; do
+    umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+  done
+done
+if awk -v t="$T_ABS/" 'index($2, t) == 1' /proc/mounts | grep -q .; then
+  echo "debootstrap-rosetta: mounts left under $T_ABS:" >&2; awk -v t="$T_ABS/" 'index($2, t) == 1 {print $2}' /proc/mounts >&2; exit 5
+fi
+exit $rc

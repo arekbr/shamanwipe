@@ -1,0 +1,52 @@
+label sw-en
+	menu label ^English - manual mode (recommended)
+	menu default
+	linux @LINUX@
+	initrd @INITRD@
+	append @APPEND_LIVE@ sw.lang=en locales=en_US.UTF-8 keyboard-layouts=us timezone=Etc/UTC
+
+label sw-pl
+	menu label ^Polski - tryb reczny (zalecany)
+	linux @LINUX@
+	initrd @INITRD@
+	append @APPEND_LIVE@ sw.lang=pl locales=pl_PL.UTF-8 keyboard-layouts=pl timezone=Europe/Warsaw
+
+label sw-inventory-en
+	menu label English - ^inventory and SMART only (erases nothing)
+	linux @LINUX@
+	initrd @INITRD@
+	append @APPEND_LIVE@ sw.lang=en locales=en_US.UTF-8 keyboard-layouts=us timezone=Etc/UTC sw.mode=inventory
+
+label sw-inventory-pl
+	menu label Polski - tylko inwentarz i SMART (niczego nie kasuje)
+	linux @LINUX@
+	initrd @INITRD@
+	append @APPEND_LIVE@ sw.lang=pl locales=pl_PL.UTF-8 keyboard-layouts=pl timezone=Europe/Warsaw sw.mode=inventory
+
+menu begin auto
+	menu label ^AUTO - erases ALL disks / kasuje WSZYSTKIE dyski ...
+	menu title AUTO - ALL disks, no prompt / WSZYSTKIE dyski bez pytan
+	label back
+		menu label ^Back / Wroc
+		menu exit
+	label sw-auto-en
+		menu label English: AUTO standard (Purge, else overwrite; 60 s)
+		linux @LINUX@
+		initrd @INITRD@
+		append @APPEND_LIVE@ sw.lang=en locales=en_US.UTF-8 keyboard-layouts=us timezone=Etc/UTC sw.auto=standard
+	label sw-auto-poweroff-en
+		menu label English: AUTO standard + power off when done
+		linux @LINUX@
+		initrd @INITRD@
+		append @APPEND_LIVE@ sw.lang=en locales=en_US.UTF-8 keyboard-layouts=us timezone=Etc/UTC sw.auto=standard sw.after=poweroff
+	label sw-auto-pl
+		menu label Polski: AUTOMAT standard (Purge, inaczej nadpis; 60 s)
+		linux @LINUX@
+		initrd @INITRD@
+		append @APPEND_LIVE@ sw.lang=pl locales=pl_PL.UTF-8 keyboard-layouts=pl timezone=Europe/Warsaw sw.auto=standard
+	label sw-auto-poweroff-pl
+		menu label Polski: AUTOMAT standard + wylacz komputer na koniec
+		linux @LINUX@
+		initrd @INITRD@
+		append @APPEND_LIVE@ sw.lang=pl locales=pl_PL.UTF-8 keyboard-layouts=pl timezone=Europe/Warsaw sw.auto=standard sw.after=poweroff
+menu end

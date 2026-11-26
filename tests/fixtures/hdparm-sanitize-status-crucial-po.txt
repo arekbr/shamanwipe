@@ -1,0 +1,6 @@
+
+/dev/sdb:
+Issuing SANITIZE_STATUS command
+Sanitize status:
+    State:    SD0 Sanitize Idle
+    Last Sanitize Operation Completed Without Error

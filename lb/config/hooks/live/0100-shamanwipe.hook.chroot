@@ -1,0 +1,21 @@
+#!/bin/sh
+# ShamanWipe live system configuration (runs in the chroot during the build).
+set -e
+
+# Network only for NTP (time in the report); there is no SSH server in the image.
+systemctl enable systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
+
+# Console font with Central European characters (Polish UI)
+if [ -f /etc/default/console-setup ]; then
+  sed -i -e 's/^CODESET=.*/CODESET="Lat2"/' \
+         -e 's/^FONTFACE=.*/FONTFACE="Terminus"/' \
+         -e 's/^FONTSIZE=.*/FONTSIZE="8x16"/' /etc/default/console-setup
+fi
+
+# Both UI locales generated in the image (live-config selects one from the locales= kernel parameter)
+sed -i -e 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' -e 's/^# *\(pl_PL.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+locale-gen
+
+# Program working directories
+install -d -m 0700 /root
+chmod 0755 /usr/local/sbin/shamanwipe

@@ -1,0 +1,28 @@
+#!/bin/sh
+# live-build configuration for ShamanWipe (Debian 13, amd64, BIOS + UEFI).
+# Language, keyboard layout and time zone are set per boot menu entry (sw.lang=, locales=, keyboard-layouts=, timezone=).
+set -e
+
+lb config noauto \
+  --mode debian \
+  --distribution trixie \
+  --architectures amd64 \
+  --archive-areas "main non-free-firmware" \
+  --binary-images iso-hybrid \
+  --bootloaders "grub-efi syslinux" \
+  --uefi-secure-boot enable \
+  --debian-installer none \
+  --apt-recommends false \
+  --firmware-binary false \
+  --firmware-chroot false \
+  --memtest none \
+  --security true \
+  --updates true \
+  --linux-flavours amd64 \
+  --checksums sha256 \
+  --chroot-squashfs-compression-type zstd \
+  --iso-application "ShamanWipe" \
+  --iso-publisher "Shamans of Silicon" \
+  --iso-volume "SHAMANWIPE" \
+  --bootappend-live "boot=live components hostname=shamanwipe live-config.noautologin noswap nopersistence console=ttyS0,115200n8 console=tty0" \
+  "${@}"

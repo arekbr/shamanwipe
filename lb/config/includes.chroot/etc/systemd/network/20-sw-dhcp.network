@@ -1,0 +1,6 @@
+# DHCP on every wired interface — only so that NTP can provide the correct time for the report.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes

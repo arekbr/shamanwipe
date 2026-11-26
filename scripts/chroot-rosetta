@@ -1,0 +1,20 @@
+#!/bin/sh
+# chroot wrapper for builds under Rosetta (installed as /usr/local/sbin/chroot in the build container).
+# Why: Rosetta needs /proc/self/exe; live-build and debootstrap call `chroot` also when /proc inside the chroot
+#      is not mounted (after "Base system installed successfully" this fails with: rosetta error: ...: 2).
+# What it does: when TARGET/proc is not a mount point, it mounts procfs FOR THE DURATION OF A SINGLE CALL and unmounts it
+#          afterwards (nothing is left in the squashfs image). When /proc is already mounted, the call is passed through unchanged.
+# Rollback: remove /usr/local/sbin/chroot in the container.
+REAL=/usr/sbin/chroot
+T=""
+for a in "$@"; do
+  case "$a" in -*) continue ;; *) T="$a"; break ;; esac
+done
+if [ -n "$T" ] && [ "$T" != "/" ] && [ -d "$T/proc" ] && [ ! -L "$T/proc" ] && ! mountpoint -q "$T/proc"; then
+  mount -t proc proc "$T/proc" || exec "$REAL" "$@"
+  "$REAL" "$@"
+  rc=$?
+  umount "$T/proc" 2>/dev/null || umount -l "$T/proc" 2>/dev/null
+  exit $rc
+fi
+exec "$REAL" "$@"

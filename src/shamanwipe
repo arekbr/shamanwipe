@@ -1,0 +1,2769 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""ShamanWipe — bezpieczne kasowanie dysków (Debian live, BIOS/UEFI). Secure disk erasure.
+
+Copyright (C) Shamans of Silicon (Szamani Krzemu). SPDX-License-Identifier: GPL-3.0-only
+
+Dobiera metodę dla każdego dysku wg tabeli decyzji (metody_sprzetowe, wybierz_metode: Sanitize / ATA Security Erase /
+NVMe Format / nadpis hosta), kasuje równolegle, weryfikuje (znaczniki albo pełny odczyt) i zapisuje podpisany raport
+(PDF, JSON, CSV, XML + MANIFEST.sha256 z podpisem Ed25519).
+
+Interfejs po angielsku albo po polsku (parametr jądra sw.lang=en|pl albo zmienna SW_LANG). Schemat raportu (klucze
+JSON/XML, nagłówki CSV) i kody statusów są stałe i angielskie, niezależnie od języka interfejsu.
+
+Klasyfikacja CLEAR/PURGE: NIST SP 800-88r2 (IX 2025) §3.1.1, §3.1.2, §3.2; IEEE 2883 niesprawdzony (płatny) —
+gdzie klasa zależy od IEEE 2883, raport mówi to wprost.
+Mutuje: wyłącznie dyski wybrane przez operatora / AUTOMAT; zapisuje raporty i dziennik na partycji SW-REPORTS.
+"""
+import argparse
+import contextlib
+import csv
+import datetime
+import fcntl
+import glob
+import hashlib
+import json
+import mmap
+import os
+import random
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import xml.etree.ElementTree as ET
+
+# ---------------------------------------------------------------------------------------------
+# Stałe
+# ---------------------------------------------------------------------------------------------
+try:
+    WERSJA = open('/etc/shamanwipe-version').read().strip()
+except OSError:
+    WERSJA = 'dev'
+
+# Tryb testowy (kontener): program widzi WYŁĄCZNIE urządzenia loop. Tylko wtedy działają haki SW_* — w systemie live
+# zmienna pozostawiona w powłoce nie skróci odliczania ani nie przełączy trybu.
+TRYB_TESTOWY = os.environ.get('SW_TEST_TYLKO_LOOP') == '1'
+
+
+def _env_test(nazwa, domyslnie=None):
+    return os.environ.get(nazwa, domyslnie) if TRYB_TESTOWY else domyslnie
+
+
+def _ustal_jezyk():
+    """Język interfejsu: SW_LANG, potem parametr jądra sw.lang=, potem LANG=pl*, inaczej angielski."""
+    j = os.environ.get('SW_LANG', '')
+    if not j:
+        tekst = _env_test('SW_TEST_CMDLINE') or ''
+        if not tekst:
+            try:
+                with open('/proc/cmdline') as f:
+                    tekst = f.read()
+            except OSError:
+                tekst = ''
+        m = re.search(r'(?:^|\s)sw\.lang=(\S+)', tekst)
+        j = m.group(1) if m else ''
+    if not j:
+        j = os.environ.get('LANG', '')[:2]
+    return 'pl' if j.lower().startswith('pl') else 'en'
+
+
+JEZYK = _ustal_jezyk()
+
+
+def L(pl, en):
+    """Tekst w języku interfejsu. Pary PL/EN stoją w miejscu użycia (jeden plik, bez katalogów tłumaczeń)."""
+    return pl if JEZYK == 'pl' else en
+
+
+KATALOG_RUN = _env_test('SW_RUN', '/run/shamanwipe')
+# Program działa naraz na tty1 i ttyS0 (.bash_profile). Blokada obejmuje operacje na dyskach (kasowanie, inwentarz,
+# nwipe, AUTOMAT); w AUTOMACIE każdy klawisz na dowolnej konsoli przerywa (obie konsole startują naraz i ścigają się).
+PLIK_BLOKADY = os.path.join(KATALOG_RUN, 'blokada')
+PLIK_AUTOMAT = os.path.join(KATALOG_RUN, 'automat.json')
+ETYKIETA_RAPORTOW = 'SW-REPORTS'
+ETYKIETA_ISO = 'SHAMANWIPE'
+LOGO = '/usr/share/shamanwipe/logo.png'
+MNT_RAPORTY = _env_test('SW_MNT_RAPORTY', '/mnt/sw-reports')
+# Celowo stałe i jawne, nie losowe: po przerwanym SE (np. zanik zasilania) dysk da się odblokować tym hasłem.
+ATA_HASLO = 'SHAMANWIPE'
+ROZMIAR_BLOKU_IO = 4 * 1024 * 1024
+ROZMIAR_PROBKI = 64 * 1024
+LICZBA_PROBEK = 512
+ODLICZANIE_AUTOMAT_S = int(_env_test('SW_ODLICZANIE', '60'))
+# Konsola niepreferowana przejmuje AUTOMAT dopiero, gdy instancji na konsoli preferowanej nie ma przez tyle sekund
+PRZEJECIE_AUTOMATU_S = int(_env_test('SW_TEST_PRZEJECIE_S', '30'))
+# Klasy sprzętu, na których technika została sprawdzona na prawdziwym sprzęcie w ShamanWipe. Pusty do czasu testów.
+ZWERYFIKOWANE_NA_SPRZECIE = set()
+
+ZRODLO_KLASYFIKACJI = L('NIST SP 800-88r2 (wrzesień 2025) §3.1.1 Clear, §3.1.2 Purge, §3.2 Cryptographic Erase',
+                        'NIST SP 800-88r2 (September 2025) §3.1.1 Clear, §3.1.2 Purge, §3.2 Cryptographic Erase')
+UWAGA_CE = L('Cryptographic Erase: skuteczność zależy od implementacji (NIST SP 800-88r2 §3.2); generator, algorytm i siła '
+             'klucza (§3.2.5) — nieznane, producent ich nie ujawnia',
+             'Cryptographic Erase: effectiveness depends on the implementation (NIST SP 800-88r2 §3.2); random number '
+             'generator, algorithm and key strength (§3.2.5) are unknown — not disclosed by the manufacturer')
+UWAGA_IEEE = L('klasa zależna od typu nośnika wg IEEE 2883 — normy nie sprawdzono (płatna)',
+               'class depends on the media type per IEEE 2883 — the standard was not checked (paywalled)')
+
+# klucz -> (klasa, opis techniki, uwaga, rodzina sprzętu do ZWERYFIKOWANE_NA_SPRZECIE)
+METODY = {
+    'nvme-sanitize-crypto':    ('PURGE', 'NVMe Sanitize — Crypto Erase', UWAGA_CE, 'nvme'),
+    'nvme-sanitize-block':     ('PURGE', 'NVMe Sanitize — Block Erase', UWAGA_IEEE, 'nvme'),
+    'nvme-sanitize-overwrite': ('PURGE', 'NVMe Sanitize — Overwrite', UWAGA_IEEE, 'nvme'),
+    'nvme-format-crypto':      ('PURGE', 'NVMe Format NVM, SES=2 (Cryptographic Erase)', UWAGA_CE, 'nvme'),
+    'nvme-format-user':        ('CLEAR', 'NVMe Format NVM, SES=1 (User Data Erase)',
+                                L('Purge wg IEEE 2883 — niesprawdzone', 'Purge per IEEE 2883 — not verified'), 'nvme'),
+    'ata-sanitize-crypto':     ('PURGE', 'ATA SANITIZE — CRYPTO SCRAMBLE EXT', UWAGA_CE, 'ata'),
+    'ata-sanitize-block':      ('PURGE', 'ATA SANITIZE — BLOCK ERASE EXT', UWAGA_IEEE, 'ata'),
+    'ata-sanitize-overwrite':  ('PURGE', 'ATA SANITIZE — OVERWRITE EXT', UWAGA_IEEE, 'ata'),
+    'ata-se-enhanced':         ('CLEAR', 'ATA SECURITY ERASE UNIT (Enhanced)',
+                                L('Purge wg openSeaChest/IEEE 2883 — niesprawdzone; jakość zależy od firmware dysku',
+                                  'Purge per openSeaChest/IEEE 2883 — not verified; quality depends on the drive firmware'), 'ata'),
+    'ata-se-normal':           ('CLEAR', 'ATA SECURITY ERASE UNIT (Normal)', '', 'ata'),
+    'scsi-sanitize-crypto':    ('PURGE', 'SCSI SANITIZE — Cryptographic Erase', UWAGA_CE, 'scsi'),
+    'scsi-sanitize-block':     ('PURGE', 'SCSI SANITIZE — Block Erase', UWAGA_IEEE, 'scsi'),
+    'scsi-sanitize-overwrite': ('PURGE', 'SCSI SANITIZE — Overwrite', UWAGA_IEEE, 'scsi'),
+    'mmc-discard-sanitize':    ('CLEAR', L('eMMC: discard całości + SANITIZE + nadpis zerami ×1',
+                                          'eMMC: full discard + SANITIZE + single-pass zero overwrite'), '', 'mmc'),
+    'overwrite-zeros':         ('CLEAR', L('Nadpis zerami ×1 przez hosta + pełny odczyt kontrolny',
+                                          'Single-pass zero overwrite by the host + full read-back'), '', 'host'),
+    'overwrite-random':        ('CLEAR', L('Nadpis danymi pseudolosowymi ×1 przez hosta',
+                                          'Single-pass pseudorandom overwrite by the host'), '', 'host'),
+}
+PROFILE = {
+    'standard':  L('Pierwsza dostępna metoda sprzętowa wg tabeli decyzji, inaczej nadpis + pełna weryfikacja',
+                   'First available hardware method from the decision table, otherwise overwrite + full verification'),
+    'max':       L('Nadpis pseudolosowy + metoda sprzętowa + weryfikacja (wysokie wymagania)',
+                   'Pseudorandom overwrite + hardware method + verification (high requirements)'),
+    'overwrite': L('Tylko nadpis zerami ×1 + pełna weryfikacja (CLEAR), bez poleceń firmware',
+                   'Single-pass zero overwrite + full verification only (CLEAR), no firmware commands'),
+}
+ALIASY_PROFILI = {'nadpis': 'overwrite'}
+# Wewnętrzne kody stanu poleceń firmware → stałe kody w dzienniku operacji
+KODY_WYNIKU = {'BLAD': 'FAILED', 'NIEZNANY': 'UNKNOWN', 'W_TOKU': 'IN_PROGRESS'}
+# Kody statusów (stałe, w raporcie i na wyjściu maszynowym) i ich nazwy w interfejsie
+STATUSY = ('ERASED', 'ERASED_WITH_WARNINGS', 'UNCONFIRMED', 'FAILED')
+KODY = {
+    'ERASED': ('SKASOWANY', 'ERASED'),
+    'ERASED_WITH_WARNINGS': ('SKASOWANY Z ZASTRZEŻENIEM', 'ERASED WITH WARNINGS'),
+    'UNCONFIRMED': ('NIEPOTWIERDZONY', 'UNCONFIRMED'),
+    'FAILED': ('NIEPOWODZENIE', 'FAILED'),
+    'INVENTORY': ('INWENTARZ', 'INVENTORY'),
+    'NONE': ('BRAK', 'NONE'),
+    'unknown': ('nieznany', 'unknown'),
+    'SD': ('karta SD', 'SD card'),
+    'usb-bridge': ('mostek USB (nie dysk)', 'USB bridge (not the disk)'),
+    'manual': ('ręczny', 'manual'),
+    'auto': ('AUTOMAT', 'AUTO'),
+    'command': ('polecenie', 'command'),
+    'inventory': ('inwentarz', 'inventory'),
+    # fazy AUTOMATU (automat.json, podgląd na drugiej konsoli)
+    'badanie': ('badanie dysków', 'scanning disks'), 'odmowa': ('odmowa', 'refused'), 'hasło': ('hasło klucza', 'key passphrase'),
+    'odliczanie': ('odliczanie', 'countdown'), 'kasowanie': ('kasowanie', 'erasing'), 'przerwany': ('przerwany', 'aborted'),
+    'koniec': ('koniec', 'finished'),
+}
+
+
+def kod(v):
+    """Nazwa kodu (status, klasa, typ nośnika, tryb) w języku interfejsu; nieznany kod bez zmian."""
+    return L(*KODY[v]) if v in KODY else v
+
+_blokada_logu = threading.Lock()
+_blokady_szyn = {}
+_blokada_szyn = threading.Lock()
+
+
+# ---------------------------------------------------------------------------------------------
+# Narzędzia
+# ---------------------------------------------------------------------------------------------
+def teraz():
+    return datetime.datetime.now().astimezone()
+
+
+def teraz_iso():
+    return teraz().isoformat(timespec='seconds')
+
+
+def log(msg, plik='run.log'):
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    with _blokada_logu:
+        with open(os.path.join(KATALOG_RUN, plik), 'a', encoding='utf-8') as f:
+            f.write(f'{teraz_iso()} {msg}\n')
+
+
+def uruchom(cmd, timeout=120, wejscie=None):
+    """Uruchamia polecenie (lista), zwraca (rc, stdout, stderr). Każde wywołanie trafia do commands.log."""
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, input=wejscie, capture_output=True, text=True, timeout=timeout, errors='replace',
+                           stdin=None if wejscie is not None else subprocess.DEVNULL)
+        rc, out, err = p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else ''
+        rc, err = 124, 'TIMEOUT'
+    except FileNotFoundError:
+        rc, out, err = 127, '', f'program not found: {cmd[0]}'
+    log(f'[{rc}] ({time.time() - t0:.1f}s) {" ".join(cmd)}\n--- stdout ---\n{out[-20000:]}\n--- stderr ---\n{err[-4000:]}',
+        'commands.log')
+    return rc, out, err
+
+
+def czytaj(sciezka, domyslnie=''):
+    try:
+        with open(sciezka) as f:
+            return f.read().strip()
+    except OSError:
+        return domyslnie
+
+
+def czytelny_rozmiar(b):
+    if b is None:
+        return '?'
+    b = float(b)
+    for jedn in ('B', 'kB', 'MB', 'GB', 'TB', 'PB'):
+        if b < 1000 or jedn == 'PB':
+            return f'{int(b)} B' if jedn == 'B' else f'{b:.1f} {jedn}'
+        b /= 1000.0
+
+
+def parametry_jadra(tekst=None):
+    wynik = {}
+    if tekst is None:  # SW_TEST_CMDLINE: tylko testy w kontenerze (tests/harness_konsole.py) — /proc/cmdline to tam jądro VM
+        tekst = _env_test('SW_TEST_CMDLINE') or czytaj('/proc/cmdline')
+    for tok in tekst.split():
+        if tok.startswith('sw.') and '=' in tok:
+            k, v = tok.split('=', 1)
+            wynik[k[3:]] = v
+    return wynik
+
+
+def rozmiar_urzadzenia(sciezka):
+    rc, out, _ = uruchom(['blockdev', '--getsize64', sciezka], timeout=20)
+    return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
+
+
+# ---------------------------------------------------------------------------------------------
+# Parsowanie wyjść narzędzi (czyste funkcje — testowane na danych z prawdziwych dysków, tests/fixtures)
+# ---------------------------------------------------------------------------------------------
+def parsuj_hdparm_I(t):
+    """Wynik `hdparm -I`. Zwraca None, gdy to nie jest odpowiedź urządzenia ATA."""
+    if not t or 'ATA device' not in t or 'Model Number' not in t:
+        return None
+
+    def pole(rx):
+        m = re.search(rx, t)
+        return m.group(1).strip() if m else ''
+
+    d = {'model': pole(r'Model Number:\s*(.+)'), 'serial': pole(r'Serial Number:\s*(.+)'),
+         'firmware': pole(r'Firmware Revision:\s*(.+)'), 'transport': pole(r'Transport:\s*(.+)')}
+    lba48 = pole(r'LBA48\s+user addressable sectors:\s*(\d+)')
+    lba28 = pole(r'LBA\s+user addressable sectors:\s*(\d+)')
+    d['sektory'] = int(lba48 or lba28 or 0)
+    d['sektor_logiczny'] = int(pole(r'Logical\s+Sector size:\s*(\d+)') or 512)
+    rot = pole(r'Nominal Media Rotation Rate:\s*(.+)')
+    if 'Solid State' in rot:
+        d['ssd'] = True
+    elif rot.isdigit():
+        d['ssd'], d['obroty'] = False, int(rot)
+    else:
+        d['ssd'] = None
+
+    sec = ''
+    m = re.search(r'^Security:\s*\n((?:[ \t].*\n?)*)', t, re.M)
+    if m:
+        sec = m.group(1)
+
+    def flaga(nazwa):
+        mm = re.search(r'^\s*(not\s+)?' + nazwa + r'\b', sec, re.M)
+        return None if not mm else (mm.group(1) is None)
+
+    bezp = {'obslugiwane': flaga('supported'), 'wlaczone': flaga('enabled'), 'zablokowane': flaga('locked'),
+            'zamrozone': flaga('frozen'), 'licznik_wyczerpany': flaga('expired'),
+            'enhanced': bool(re.search(r'supported:\s*enhanced erase', sec)), 'czas_min': None, 'czas_enh_min': None}
+    mm = re.search(r'(\d+)min for SECURITY ERASE UNIT', sec)
+    if mm:
+        bezp['czas_min'] = int(mm.group(1))
+    mm = re.search(r'(\d+)min for ENHANCED SECURITY ERASE UNIT', sec)
+    if mm:
+        bezp['czas_enh_min'] = int(mm.group(1))
+    d['bezpieczenstwo'] = bezp
+    obsl = bool(re.search(r'SANITIZE feature set', t))
+    d['sanitize'] = {'obslugiwany': obsl,
+                     'crypto': obsl and bool(re.search(r'CRYPTO_SCRAMBLE_EXT command', t)),
+                     'block': obsl and bool(re.search(r'BLOCK_ERASE_EXT command', t)),
+                     'overwrite': obsl and bool(re.search(r'OVERWRITE_EXT command', t))}
+    return d
+
+
+def parsuj_hdparm_N(t):
+    """`hdparm -N`: 'max sectors = 1953525168/1953525168, HPA is disabled'."""
+    m = re.search(r'max sectors\s*=\s*(\d+)/(\d+),\s*(?:HPA|accessible max address)[^\n]*?is\s+(enabled|disabled)', t or '')
+    if not m:
+        return None
+    biezace, natywne = int(m.group(1)), int(m.group(2))
+    return {'biezace': biezace, 'natywne': natywne, 'hpa_wlaczony': m.group(3) == 'enabled' or biezace < natywne}
+
+
+def parsuj_dco(t):
+    m = re.search(r'Real max sectors:\s*(\d+)', t or '')
+    return int(m.group(1)) if m else None
+
+
+def ocen_sanitize_status(t):
+    """`hdparm --sanitize-status` → 'OK' | 'W_TOKU' | 'BLAD' | 'NIEZNANY' (+ postęp %)."""
+    t = t or ''
+    postep = None
+    m = re.search(r'Progress:\s*0x([0-9a-f]+)', t, re.I)
+    if m:
+        postep = round(int(m.group(1), 16) * 100 / 65535, 1)
+    if re.search(r'In Process|SD2', t):
+        return 'W_TOKU', postep
+    if re.search(r'Completed Without Error', t, re.I):
+        return 'OK', 100.0
+    if re.search(r'Completed With Error|failed|SD1', t, re.I):
+        return 'BLAD', postep
+    return 'NIEZNANY', postep
+
+
+def ocen_po_security_erase(rc, tekst_identify_po, serial_przed):
+    """Warunek sukcesu ATA SE: IDENTIFY po, ten sam S/N, Security not enabled / not locked.
+
+    Zwraca (wynik, opis): 'OK' | 'UNCONFIRMED' | 'BLAD'.
+    Bywa SSD, który po SE zwraca rc=0, a na IDENTIFY nie odpowiada → UNCONFIRMED, nie sukces.
+    """
+    if rc != 0:
+        return 'BLAD', L(f'polecenie zakończone kodem {rc}', f'command exited with code {rc}')
+    a = parsuj_hdparm_I(tekst_identify_po)
+    if a is None:
+        return 'UNCONFIRMED', L('polecenie zakończone kodem 0, ale dysk nie odpowiada na IDENTIFY — stanu nie da się potwierdzić',
+                                'command exited with code 0, but the drive does not answer IDENTIFY — the state cannot be confirmed')
+    if serial_przed and a.get('serial') != serial_przed:
+        return 'BLAD', L(f'po operacji inny numer seryjny ({a.get("serial")} ≠ {serial_przed})',
+                         f'different serial number after the operation ({a.get("serial")} ≠ {serial_przed})')
+    b = a['bezpieczenstwo']
+    if b.get('wlaczone') or b.get('zablokowane'):
+        return 'BLAD', L('po operacji hasło ATA nadal ustawione / dysk zablokowany',
+                         'ATA password still set / drive locked after the operation')
+    if b.get('wlaczone') is None and b.get('zablokowane') is None:
+        return 'UNCONFIRMED', L('IDENTIFY po bez sekcji Security', 'IDENTIFY afterwards has no Security section')
+    return 'OK', L('IDENTIFY po: ten sam S/N, Security not enabled, not locked',
+                   'IDENTIFY afterwards: same S/N, Security not enabled, not locked')
+
+
+def parsuj_nvme_id_ctrl(js):
+    d = json.loads(js) if isinstance(js, str) else js
+    sanicap, fna, oacs = int(d.get('sanicap', 0)), int(d.get('fna', 0)), int(d.get('oacs', 0))
+    return {'model': str(d.get('mn', '')).strip(), 'serial': str(d.get('sn', '')).strip(),
+            'firmware': str(d.get('fr', '')).strip(),
+            'sanitize': {'crypto': bool(sanicap & 1), 'block': bool(sanicap & 2), 'overwrite': bool(sanicap & 4)},
+            'format_obslugiwany': bool(oacs & 2), 'format_wszystkie_ns': bool(fna & 1), 'format_crypto': bool(fna & 4),
+            'sanicap': sanicap, 'fna': fna, 'oacs': oacs}
+
+
+def parsuj_nvme_id_ns(js):
+    d = json.loads(js) if isinstance(js, str) else js
+    flbas = int(d.get('flbas', 0))
+    lbaf = (flbas & 0xF) | (((flbas >> 5) & 0x3) << 4)
+    lbafs = d.get('lbafs') or []
+    ds = int(lbafs[lbaf].get('ds', 9)) if lbaf < len(lbafs) else 9
+    nsze = int(d.get('nsze', 0))
+    return {'lbaf': lbaf, 'ms': (flbas >> 4) & 1, 'pi': int(d.get('dps', 0)) & 7, 'nsze': nsze,
+            'rozmiar_b': nsze * (1 << ds) if nsze else None}
+
+
+def parsuj_sg_opcodes(t):
+    s = {'crypto': False, 'block': False, 'overwrite': False}
+    for linia in (t or '').splitlines():
+        m = re.search(r'Sanitize,\s*(overwrite|block erase|cryptographic erase)', linia, re.I)
+        if m:
+            s[{'overwrite': 'overwrite', 'block erase': 'block', 'cryptographic erase': 'crypto'}[m.group(1).lower()]] = True
+    return s
+
+
+def znajdz_klucze(obj, klucze):
+    """Pierwsze wystąpienia kluczy w zagnieżdżonym JSON (formaty nvme-cli zmieniają się między wersjami)."""
+    wynik = {}
+
+    def _r(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in klucze and k not in wynik and not isinstance(v, (dict, list)):
+                    wynik[k] = v
+                _r(v)
+        elif isinstance(o, list):
+            for v in o:
+                _r(v)
+    _r(obj)
+    return wynik
+
+
+def parsuj_smart(js):
+    try:
+        d = json.loads(js)
+    except (ValueError, TypeError):
+        return {'dostepny': False}
+    s = {'dostepny': True, 'zdrowie': (d.get('smart_status') or {}).get('passed'),
+         'godziny_pracy': (d.get('power_on_time') or {}).get('hours'),
+         'temperatura': (d.get('temperature') or {}).get('current'),
+         'model': d.get('model_name'), 'serial': d.get('serial_number'), 'firmware': d.get('firmware_version'),
+         'obroty': d.get('rotation_rate'), 'protokol': (d.get('device') or {}).get('protocol')}
+    for a in ((d.get('ata_smart_attributes') or {}).get('table') or []):
+        nazwa = {5: 'realokowane', 197: 'oczekujace', 198: 'nienaprawialne'}.get(a.get('id'))
+        if nazwa:
+            s[nazwa] = (a.get('raw') or {}).get('value')
+    nv = d.get('nvme_smart_health_information_log') or {}
+    if nv:
+        s['zuzycie_proc'] = nv.get('percentage_used')
+        s['bledy_nosnika'] = nv.get('media_errors')
+    return s
+
+
+def pogorszenie_smart(przed, po):
+    """Lista zastrzeżeń stanu dysku (SMART FAILED, wzrost 5/197/198, błędy nośnika NVMe)."""
+    z = []
+    if po.get('zdrowie') is False or przed.get('zdrowie') is False:
+        z.append(L('SMART: ocena zdrowia FAILED', 'SMART: overall health FAILED'))
+    for k, opis in (('realokowane', L('realokowane (5)', 'reallocated (5)')), ('oczekujace', L('oczekujące (197)', 'pending (197)')),
+                    ('nienaprawialne', L('nienaprawialne (198)', 'uncorrectable (198)')),
+                    ('bledy_nosnika', L('błędy nośnika NVMe', 'NVMe media errors'))):
+        a, b = przed.get(k), po.get(k)
+        if isinstance(a, int) and isinstance(b, int) and b > a:
+            z.append(L(f'SMART: wzrost licznika {opis} {a} → {b}', f'SMART: {opis} counter increased {a} → {b}'))
+    if (przed.get('oczekujace') or 0) > 0:
+        z.append(L(f'SMART: {przed["oczekujace"]} sektorów oczekujących (197) — dysk ma nieczytelne sektory',
+                   f'SMART: {przed["oczekujace"]} pending sectors (197) — the drive has unreadable sectors'))
+    return z
+
+
+# ---------------------------------------------------------------------------------------------
+# Nośnik startowy i inwentarz
+# ---------------------------------------------------------------------------------------------
+WZORZEC_RAID_SPRZETOWY = re.compile(
+    r'PERC|MegaRAID|Smart Array|LOGICAL VOLUME|ServeRAID|Adaptec|AVAGO|LSI\b|MR\d{4}|RAID|Virtual Disk', re.I)
+
+
+def dyski_pod(nazwa, glebokosc=0):
+    """Zbiór dysków fizycznych pod urządzeniem blokowym (partycja → dysk, dm → slaves, loop → plik → dysk)."""
+    if glebokosc > 8 or not nazwa:
+        return set()
+    nazwa = os.path.basename(nazwa)
+    sys_ = f'/sys/class/block/{nazwa}'
+    if not os.path.exists(sys_):
+        return set()
+    if os.path.exists(f'{sys_}/partition'):
+        rodzic = os.path.basename(os.path.dirname(os.path.realpath(sys_)))
+        return dyski_pod(rodzic, glebokosc + 1)
+    slaves = glob.glob(f'{sys_}/slaves/*')
+    if slaves:
+        wynik = set()
+        for s in slaves:
+            wynik |= dyski_pod(os.path.basename(s), glebokosc + 1)
+        return wynik
+    plik = czytaj(f'{sys_}/loop/backing_file')
+    if plik:  # chroniony i sam loop, i dysk, na którym leży jego plik (findiso=, Ventoy)
+        rc, out, _ = uruchom(['findmnt', '-n', '-o', 'SOURCE', '-T', plik], timeout=10)
+        return {nazwa} | (dyski_pod(out.strip().split('[')[0], glebokosc + 1) if rc == 0 else set())
+    return {nazwa}
+
+
+def nosnik_startowy():
+    """(chronione: {dysk: powód}, jednoznaczny: bool) — dyski nośnika live i dyski z etykietą ISO/raportów."""
+    chronione, jednoznaczny = {}, False
+    rc, out, _ = uruchom(['findmnt', '-n', '-o', 'SOURCE', '/run/live/medium'], timeout=10)
+    for zrodlo in out.split():
+        dyski = dyski_pod(zrodlo.split('[')[0])
+        for d in dyski:
+            chronione[d] = L('nośnik startowy (live)', 'boot medium (live)')
+        jednoznaczny = jednoznaczny or bool(dyski)
+    # Etykiety sondowane bezpośrednio (blkid -c /dev/null), NIE z bazy udev: lsblk bez udev zwraca pustą etykietę,
+    # a wtedy nośnik z etykietą SHAMANWIPE nie byłby chroniony.
+    for etykieta in (ETYKIETA_ISO, ETYKIETA_RAPORTOW):
+        rc, out, _ = uruchom(['blkid', '-c', '/dev/null', '-o', 'device', '-t', f'LABEL={etykieta}'], timeout=30)
+        for urz in out.split():
+            for dysk in dyski_pod(urz):
+                chronione.setdefault(dysk, L(f'nośnik z etykietą {etykieta}', f'medium labelled {etykieta}'))
+                if etykieta == ETYKIETA_ISO:
+                    jednoznaczny = True
+    return chronione, jednoznaczny
+
+
+def zamontowane_dyski():
+    rc, out, _ = uruchom(['lsblk', '-J', '-o', 'NAME,MOUNTPOINTS,TYPE'], timeout=20)
+    wynik, swapy = {}, czytaj('/proc/swaps')
+
+    def ma(r):
+        mp = [m for m in (r.get('mountpoints') or []) if m]
+        if mp or f"/dev/{r['name']} " in swapy:
+            return mp or ['[swap]']
+        for c in r.get('children') or []:
+            x = ma(c)
+            if x:
+                return x
+        return None
+    try:
+        for urz in json.loads(out).get('blockdevices', []):
+            x = ma(urz)
+            if x:
+                wynik[urz['name']] = x
+    except ValueError:
+        pass
+    return wynik
+
+
+def zawartosc_dysku(sciezka):
+    rc, out, _ = uruchom(['lsblk', '-n', '-r', '-o', 'FSTYPE', sciezka], timeout=20)
+    return sorted({x for x in out.split() if x})
+
+
+def kontroler_nvme(nazwa):
+    b = os.path.basename(os.path.realpath(f'/sys/block/{nazwa}/device'))
+    if re.fullmatch(r'nvme\d+', b):
+        return '/dev/' + b
+    m = re.match(r'(nvme\d+)n\d+', nazwa)
+    return '/dev/' + m.group(1) if m else None
+
+
+def liczba_namespace(kontroler):
+    k = os.path.basename(kontroler)
+    return len([p for p in glob.glob(f'/sys/class/nvme/{k}/{k}n*') if re.fullmatch(rf'{k}n\d+', os.path.basename(p))]) or 1
+
+
+def szyna_usb(nazwa):
+    """Identyfikator urządzenia USB (np. '2-1.3') — polecenia firmware na jednym mostku idą szeregowo."""
+    m = re.findall(r'/(\d+-[\d.]+)(?=/)', os.path.realpath(f'/sys/block/{nazwa}'))
+    return m[-1] if m else None
+
+
+def smart_json(sciezka, transport):
+    rc, js, _ = uruchom(['smartctl', '-x', '-j', sciezka], timeout=90)
+    s = parsuj_smart(js)
+    # Przez mostek USB bez -d sat tabela atrybutów bywa PUSTA (wygląda jak dysk bez błędów)
+    if s.get('godziny_pracy') is None and not sciezka.startswith('/dev/nvme'):
+        rc2, js2, _ = uruchom(['smartctl', '-x', '-j', '-d', 'sat', sciezka], timeout=90)
+        s2 = parsuj_smart(js2)
+        if s2.get('godziny_pracy') is not None:
+            return s2, js2
+    return s, js
+
+
+def badaj_dysk(d):
+    sc = d['sciezka']
+    d['smart_przed'], d['smart_przed_surowy'] = smart_json(sc, d.get('transport'))
+    d['zawartosc'] = zawartosc_dysku(sc)
+    d['rozmiar_urzadzenia_b'] = d['rozmiar_b']
+    d['serial_zrodlo'] = 'lsblk'
+
+    if d['nazwa'].startswith('nvme'):
+        d['interfejs'], d['typ_nosnika'] = 'nvme', 'NVMe SSD'
+        ktrl = kontroler_nvme(d['nazwa'])
+        nv = {}
+        rc, out, _ = uruchom(['nvme', 'id-ctrl', ktrl, '-o', 'json'], timeout=30)
+        if rc == 0:
+            try:
+                nv = parsuj_nvme_id_ctrl(out)
+            except (ValueError, TypeError):
+                nv = {}
+        rc, out, _ = uruchom(['nvme', 'id-ns', sc, '-o', 'json'], timeout=30)
+        if rc == 0:
+            try:
+                nv['ns'] = parsuj_nvme_id_ns(out)
+                d['rozmiar_identify_b'] = nv['ns'].get('rozmiar_b')
+            except (ValueError, TypeError, IndexError):
+                pass
+        rc, out, _ = uruchom(['nvme', 'sanitize-log', ktrl, '-o', 'json'], timeout=30)
+        if rc == 0:
+            try:
+                nv['sstat_przed'] = int(znajdz_klucze(json.loads(out), {'sstat'}).get('sstat', 0))
+            except ValueError:
+                pass
+        nv['kontroler'] = ktrl
+        nv['liczba_ns'] = liczba_namespace(ktrl) if ktrl else 1
+        d['nvme'] = nv
+        if nv.get('serial'):
+            d['serial'], d['serial_zrodlo'] = nv['serial'], 'NVMe Identify'
+        for k in ('model', 'firmware'):
+            d[k] = nv.get(k) or d.get(k)
+    elif d['nazwa'].startswith('mmcblk'):
+        d['interfejs'] = 'mmc'
+        d['typ_nosnika'] = 'eMMC' if czytaj(f'/sys/block/{d["nazwa"]}/device/type') == 'MMC' else 'SD'
+    else:
+        rc, out, _ = uruchom(['hdparm', '-I', sc], timeout=30)
+        ata = parsuj_hdparm_I(out) if rc == 0 else None
+        if ata:
+            d['interfejs'] = 'ata'
+            rc, out, _ = uruchom(['hdparm', '-N', sc], timeout=20)
+            ata['hpa'] = parsuj_hdparm_N(out)
+            rc, out, _ = uruchom(['hdparm', '--dco-identify', sc], timeout=20)
+            ata['dco_max'] = parsuj_dco(out)
+            if ata['sanitize']['obslugiwany']:
+                rc, out, _ = uruchom(['hdparm', '--sanitize-status', sc], timeout=20)
+                ata['sanitize_stan_przed'] = ocen_sanitize_status(out)[0]
+            d['ata'] = ata
+            if ata.get('serial'):
+                d['serial'], d['serial_zrodlo'] = ata['serial'], 'ATA IDENTIFY'
+            for k in ('model', 'firmware'):
+                d[k] = ata.get(k) or d.get(k)
+            d['rozmiar_identify_b'] = ata['sektory'] * ata['sektor_logiczny'] if ata['sektory'] else None
+            d['typ_nosnika'] = {True: 'SSD', False: 'HDD'}.get(ata.get('ssd'), '')
+        else:
+            rc, out, _ = uruchom(['sg_opcodes', sc], timeout=30)
+            s = parsuj_sg_opcodes(out) if rc == 0 else {'crypto': False, 'block': False, 'overwrite': False}
+            if any(s.values()):
+                d['interfejs'], d['scsi'] = 'scsi', {'sanitize': s}
+            else:
+                d['interfejs'] = 'block'
+        if not d.get('typ_nosnika'):
+            sm = d['smart_przed']
+            if sm.get('obroty') == 0:
+                d['typ_nosnika'] = 'SSD'
+            elif sm.get('obroty') or d.get('rota'):
+                d['typ_nosnika'] = 'HDD'
+            else:
+                d['typ_nosnika'] = 'unknown'
+    for k in ('model', 'serial', 'firmware'):
+        if not d.get(k):
+            d[k] = d['smart_przed'].get(k) or ''
+            if k == 'serial' and d[k]:
+                d['serial_zrodlo'] = 'SMART'
+    if d.get('transport') == 'usb' and d['serial_zrodlo'] == 'lsblk':
+        d['serial_zrodlo'] = 'usb-bridge'
+    if d.get('transport') not in ('nvme', 'usb') and WZORZEC_RAID_SPRZETOWY.search(f"{d.get('vendor', '')} {d.get('model', '')}"):
+        d['raid_sprzetowy'] = True
+    if d.get('transport') == 'usb':
+        d['szyna'] = szyna_usb(d['nazwa'])
+    return d
+
+
+def inwentarz(szczegolowo=True):
+    rc, out, _ = uruchom(['lsblk', '-J', '-b', '-d', '-o',
+                          'NAME,PATH,TYPE,TRAN,SIZE,MODEL,SERIAL,ROTA,RM,RO,VENDOR,REV,WWN,LOG-SEC'], timeout=30)
+    try:
+        urz = json.loads(out).get('blockdevices', [])
+    except ValueError:
+        urz = []
+    startowe, jednoznaczny = nosnik_startowy()
+    montowane = zamontowane_dyski()
+    dyski = []
+    tylko_loop = TRYB_TESTOWY  # testy w kontenerze: widać tam dyski VM — nie wolno ich dotknąć
+    for u in urz:
+        n = u.get('name', '')
+        if tylko_loop:
+            if not n.startswith('loop') or not int(u.get('size') or 0):
+                continue
+        elif u.get('type') != 'disk' or re.match(r'(loop|ram|zram|sr|fd|md|dm-|nbd)', n):
+            continue
+        d = {'nazwa': n, 'sciezka': u.get('path') or f'/dev/{n}', 'transport': (u.get('tran') or ''),
+             'rozmiar_b': int(u.get('size') or 0), 'model': (u.get('model') or '').strip(),
+             'serial': (u.get('serial') or '').strip(), 'vendor': (u.get('vendor') or '').strip(),
+             'firmware': (u.get('rev') or '').strip(), 'wwn': u.get('wwn') or '', 'rota': bool(u.get('rota')),
+             'sektor_logiczny': int(u.get('log-sec') or 512), 'chroniony': []}
+        if n in startowe:
+            d['chroniony'].append(startowe[n])
+        if n in montowane:
+            d['chroniony'].append(L('zamontowany: ', 'mounted: ') + ', '.join(montowane[n]))
+        if u.get('ro'):
+            d['chroniony'].append(L('urządzenie tylko do odczytu', 'read-only device'))
+        if d['rozmiar_b'] == 0:
+            d['chroniony'].append(L('rozmiar 0 (brak nośnika)', 'size 0 (no media)'))
+        dyski.append(d)
+    if szczegolowo:
+        watki = [threading.Thread(target=badaj_dysk, args=(d,)) for d in dyski]
+        for w in watki:
+            w.start()
+        for w in watki:
+            w.join()
+    sn = {}
+    for d in dyski:
+        if d.get('serial'):
+            sn.setdefault(d['serial'], []).append(d)
+    for lista in sn.values():
+        if len(lista) > 1:
+            for d in lista:
+                d['chroniony'].append(L('ten sam numer seryjny ma kilka urządzeń (multipath/mostek) — wyjaśnij ręcznie',
+                                        'several devices report the same serial number (multipath/bridge) — resolve manually'))
+    inwentarz.nosnik_jednoznaczny = jednoznaczny
+    return dyski
+
+
+inwentarz.nosnik_jednoznaczny = False
+
+
+def tozsamosc(d):
+    return {'serial': d.get('serial') or '', 'rozmiar_b': d.get('rozmiar_b')}
+
+
+def odczytaj_tozsamosc(d):
+    """Aktualny S/N i rozmiar pod ścieżką dysku (do porównania tuż przed poleceniem niszczącym)."""
+    sc = d['sciezka']
+    serial = ''
+    if d.get('interfejs') == 'nvme':
+        rc, out, _ = uruchom(['nvme', 'id-ctrl', d['nvme']['kontroler'], '-o', 'json'], timeout=30)
+        try:
+            serial = parsuj_nvme_id_ctrl(out)['serial'] if rc == 0 else ''
+        except (ValueError, TypeError):
+            serial = ''
+    elif d.get('interfejs') == 'ata':
+        rc, out, _ = uruchom(['hdparm', '-I', sc], timeout=30)
+        a = parsuj_hdparm_I(out)
+        serial = a['serial'] if a else ''
+    else:
+        rc, out, _ = uruchom(['lsblk', '-n', '-d', '-o', 'SERIAL', sc], timeout=10)
+        serial = out.strip()
+        if not serial and d.get('serial_zrodlo') == 'SMART':
+            serial = parsuj_smart(uruchom(['smartctl', '-i', '-j', sc], timeout=60)[1]).get('serial') or ''
+    return {'serial': serial, 'rozmiar_b': rozmiar_urzadzenia(sc)}
+
+
+def zgodna_tozsamosc(zapisana, biezaca):
+    if zapisana['serial'] and biezaca['serial'] != zapisana['serial']:
+        return False
+    return biezaca['rozmiar_b'] == zapisana['rozmiar_b']
+
+
+# ---------------------------------------------------------------------------------------------
+# Dobór metody — tabela decyzji (wyrocznia testów tests/test_dobor.py)
+# ---------------------------------------------------------------------------------------------
+def metody_sprzetowe(d, kontrolery_wspolne=None):
+    """Lista metod sprzętowych w kolejności preferencji + uwagi + blokada (powód, gdy kasowanie niemożliwe)."""
+    uwagi, wynik = [], []
+    interfejs = d.get('interfejs', 'block')
+    nosnik = d.get('typ_nosnika', 'unknown')
+    if d.get('raid_sprzetowy'):
+        uwagi.append(L('Wolumen kontrolera RAID sprzętowego: polecenia firmware nie dotrą do dysków. Dla metody sprzętowej '
+                       'przełącz kontroler w tryb HBA/JBOD. Możliwy tylko nadpis wolumenu, bez potwierdzenia zakresu.',
+                       'Hardware RAID controller volume: firmware commands cannot reach the drives. For a hardware method '
+                       'switch the controller to HBA/JBOD mode. Only a volume overwrite is possible, without range confirmation.'))
+        return [], uwagi, None
+    if interfejs == 'nvme':
+        nv = d.get('nvme', {})
+        s = nv.get('sanitize', {})
+        if (nv.get('sstat_przed') or 0) & 7 == 2:
+            return [], uwagi, L('NVMe: poprzedni Sanitize nadal w toku — poczekaj na jego koniec i uruchom ponownie',
+                                'NVMe: a previous Sanitize is still in progress — wait for it to finish and run again')
+        if (nv.get('sstat_przed') or 0) & 7 == 3:
+            uwagi.append(L('NVMe: poprzedni Sanitize zakończony błędem — wymagany ponowny Sanitize',
+                           'NVMe: the previous Sanitize failed — a new Sanitize is required'))
+        caly = nv.get('liczba_ns', 1) == 1 or bool(kontrolery_wspolne and nv.get('kontroler') in kontrolery_wspolne)
+        if caly:
+            wynik += [m for m, k in (('nvme-sanitize-crypto', 'crypto'), ('nvme-sanitize-block', 'block'),
+                                     ('nvme-sanitize-overwrite', 'overwrite')) if s.get(k)]
+            if nv.get('liczba_ns', 1) > 1 and any(s.values()):
+                uwagi.append(L('Sanitize obejmuje cały kontroler — wszystkie namespace, także nieprzyłączone.',
+                               'Sanitize covers the whole controller — all namespaces, including unattached ones.'))
+        elif any(s.values()):
+            uwagi.append(L('Kontroler NVMe ma kilka namespace, nie wszystkie wybrane — Sanitize (cały kontroler) pominięty.',
+                           'The NVMe controller has several namespaces, not all selected — Sanitize (whole controller) skipped.'))
+        if nv.get('format_obslugiwany'):
+            if nv.get('format_wszystkie_ns') and not caly:
+                uwagi.append(L('Format NVM działa na wszystkie namespace kontrolera — pominięty.',
+                               'Format NVM applies to all namespaces of the controller — skipped.'))
+            else:
+                if nv.get('format_crypto'):
+                    wynik.append('nvme-format-crypto')
+                wynik.append('nvme-format-user')
+    elif interfejs == 'ata':
+        a = d.get('ata', {})
+        s, b = a.get('sanitize', {}), a.get('bezpieczenstwo', {})
+        if b.get('zablokowane'):
+            return [], uwagi, L('Dysk ZABLOKOWANY hasłem ATA poprzedniego właściciela — bez hasła (user/master) '
+                                'albo PSID nie da się go skasować. NIE przechodzę na nadpis.',
+                                'Drive LOCKED with the previous owner\'s ATA password — it cannot be erased without the '
+                                'password (user/master) or PSID. NOT falling back to overwrite.')
+        if a.get('sanitize_stan_przed') == 'W_TOKU':
+            return [], uwagi, L('ATA: poprzedni SANITIZE nadal w toku — poczekaj na koniec',
+                                'ATA: a previous SANITIZE is still in progress — wait for it to finish')
+        if s.get('crypto'):
+            wynik.append('ata-sanitize-crypto')
+        if s.get('block') and nosnik != 'HDD':
+            wynik.append('ata-sanitize-block')
+        if s.get('overwrite'):
+            wynik.append('ata-sanitize-overwrite')
+        if b.get('obslugiwane') and not b.get('licznik_wyczerpany'):
+            if b.get('wlaczone'):
+                uwagi.append(L('Hasło ATA już ustawione (dysk odblokowany przez BIOS?) — Security Erase pominięty.',
+                               'ATA password already set (drive unlocked by the BIOS?) — Security Erase skipped.'))
+            else:
+                if b.get('enhanced'):
+                    wynik.append('ata-se-enhanced')
+                wynik.append('ata-se-normal')
+    elif interfejs == 'scsi':
+        s = d.get('scsi', {}).get('sanitize', {})
+        if s.get('crypto'):
+            wynik.append('scsi-sanitize-crypto')
+        if s.get('block') and nosnik != 'HDD':
+            wynik.append('scsi-sanitize-block')
+        if s.get('overwrite'):
+            wynik.append('scsi-sanitize-overwrite')
+    elif interfejs == 'mmc' and nosnik == 'eMMC':
+        wynik.append('mmc-discard-sanitize')
+    return wynik, uwagi, None
+
+
+def wybierz_metode(d, profil='standard', kontrolery_wspolne=None, automat=False):
+    """Plan dla dysku: kroki, zapasowe, klasa, technika, przygotowanie, uwagi, mozliwe."""
+    plan = {'kroki': [], 'zapasowe': [], 'uwagi': [], 'przygotowanie': [], 'mozliwe': True}
+    if d.get('chroniony'):
+        plan['mozliwe'] = False
+        plan['uwagi'].append(L('Dysk chroniony: ', 'Protected disk: ') + '; '.join(d['chroniony']))
+        return plan
+    if automat and d.get('raid_sprzetowy'):
+        plan['mozliwe'] = False
+        plan['uwagi'].append(L('AUTOMAT pomija wolumeny RAID sprzętowego (zakresu nie da się potwierdzić).',
+                               'AUTO skips hardware RAID volumes (the erase range cannot be confirmed).'))
+        return plan
+    sprzetowe, uwagi, blokada = metody_sprzetowe(d, kontrolery_wspolne)
+    plan['uwagi'] += uwagi
+    if blokada:
+        plan['mozliwe'] = False
+        plan['uwagi'].append(blokada)
+        return plan
+    if d.get('transport') == 'usb' and d.get('interfejs') == 'block':
+        plan['uwagi'].append(L('Mostek USB nie przepuszcza poleceń ATA/SCSI — możliwy tylko nadpis, bez IDENTIFY zakres '
+                               'niepotwierdzony. Mostek UAS (np. VIA VL711) bywa do obejścia: `shamanwipe usb-bot`.',
+                               'The USB bridge does not pass ATA/SCSI commands — only an overwrite is possible, and without '
+                               'IDENTIFY the range is unconfirmed. A UAS bridge (e.g. VIA VL711) can often be worked around: '
+                               '`shamanwipe usb-bot`.'))
+
+    profil = ALIASY_PROFILI.get(profil, profil)
+    if profil == 'overwrite':
+        kroki = ['overwrite-zeros']
+    elif profil == 'max':
+        kroki = ['overwrite-random'] + (sprzetowe[:1] if sprzetowe else ['overwrite-zeros'])
+    else:
+        kroki = sprzetowe[:1] if sprzetowe else ['overwrite-zeros']
+    plan['kroki'] = kroki
+    plan['zapasowe'] = [m for m in sprzetowe if m not in kroki] + ([] if 'overwrite-zeros' in kroki else ['overwrite-zeros'])
+
+    a = d.get('ata', {})
+    if any(k.startswith('ata-se') for k in kroki) and a.get('bezpieczenstwo', {}).get('zamrozone'):
+        plan['przygotowanie'].append('unfreeze')
+        plan['uwagi'].append(L('Dysk „frozen” — przed Security Erase próba odmrożenia przez uśpienie komputera.',
+                               'Drive is "frozen" — before Security Erase the computer is suspended briefly to unfreeze it.'))
+    hpa = a.get('hpa') or {}
+    if hpa.get('hpa_wlaczony') or (a.get('dco_max') and a.get('sektory') and a['dco_max'] > a['sektory']):
+        plan['przygotowanie'].append('restore-max-lba')
+        plan['uwagi'].append(L('Wykryto ukryty obszar (HPA/DCO) — przed kasowaniem przywracany pełny rozmiar.',
+                               'Hidden area detected (HPA/DCO) — the full capacity is restored before erasure.'))
+    uzupelnij_plan(plan, d)
+    return plan
+
+
+def uzupelnij_plan(plan, d):
+    kroki = plan['kroki']
+    klasy = {METODY[k][0] for k in kroki}
+    plan['klasa'] = 'PURGE' if 'PURGE' in klasy else 'CLEAR'
+    if (d.get('interfejs') == 'block' and d.get('transport') == 'usb') or d.get('raid_sprzetowy'):
+        plan['klasa'] = 'NONE'
+    plan['technika'] = ' → '.join(METODY[k][1] for k in kroki)
+    plan['uwagi_metody'] = [METODY[k][2] for k in kroki if METODY[k][2]]
+    rodziny = {METODY[k][3] for k in kroki if METODY[k][3] != 'host'}
+    plan['niezweryfikowane_na_sprzecie'] = sorted(r for r in rodziny if r not in ZWERYFIKOWANE_NA_SPRZECIE)
+    ost = kroki[-1] if kroki else ''
+    plan['weryfikacja'] = (L('pełny odczyt — każdy bajt = 0x00', 'full read-back — every byte = 0x00')
+                           if ost in ('overwrite-zeros', 'mmc-discard-sanitize')
+                           else L(f'znaczniki: {LICZBA_PROBEK} × {ROZMIAR_PROBKI // 1024} KiB zapisane przed kasowaniem, '
+                                  'po kasowaniu każdy musi zniknąć + stan urządzenia + brak sygnatur',
+                                  f'markers: {LICZBA_PROBEK} × {ROZMIAR_PROBKI // 1024} KiB written before erasure, each must '
+                                  'be gone afterwards + device state + no signatures'))
+
+
+def plan_dla_wszystkich(dyski, profil, wybrane=None, automat=False):
+    wybrane = set(wybrane) if wybrane is not None else {d['sciezka'] for d in dyski if not d.get('chroniony')}
+    ns, wyb = {}, {}
+    for d in dyski:
+        k = d.get('nvme', {}).get('kontroler')
+        if k:
+            ns[k] = ns.get(k, 0) + 1
+            if d['sciezka'] in wybrane and not d.get('chroniony'):
+                wyb[k] = wyb.get(k, 0) + 1
+    wspolne = {k for k, n in ns.items() if wyb.get(k) == n}
+    for d in dyski:
+        if d['sciezka'] in wybrane:
+            d['plan'] = wybierz_metode(d, profil, wspolne, automat)
+            d['tozsamosc'] = tozsamosc(d)
+    return [d for d in dyski if d['sciezka'] in wybrane]
+
+
+# ---------------------------------------------------------------------------------------------
+# Odczyt/zapis bezpośredni (O_DIRECT) i weryfikacja
+# ---------------------------------------------------------------------------------------------
+class UrzadzenieBlokowe:
+    def __init__(self, sciezka, zapis=False):
+        flagi = os.O_RDWR if zapis else os.O_RDONLY
+        self.direct = True
+        try:
+            self.fd = os.open(sciezka, flagi | os.O_DIRECT)
+        except OSError:
+            self.fd = os.open(sciezka, flagi)
+            self.direct = False
+        self.rozmiar = os.lseek(self.fd, 0, os.SEEK_END)
+
+    def czytaj(self, bufor, poz, dl):
+        n = os.preadv(self.fd, [memoryview(bufor)[:dl]], poz)
+        if not self.direct:
+            os.posix_fadvise(self.fd, poz, dl, os.POSIX_FADV_DONTNEED)
+        return n
+
+    def pisz(self, bufor, poz, dl):
+        return os.pwritev(self.fd, [memoryview(bufor)[:dl]], poz)
+
+    def zamknij(self):
+        try:
+            os.fsync(self.fd)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+def pozycje_probek(rozmiar, n=LICZBA_PROBEK, wielkosc=ROZMIAR_PROBKI):
+    if rozmiar <= wielkosc:
+        return [0]
+    poz = {0, (rozmiar - wielkosc) // 4096 * 4096}
+    for i in range(1, n - 1):
+        poz.add(((rozmiar - wielkosc) * i // (n - 1)) // 4096 * 4096)
+    return sorted(poz)
+
+
+def czytaj_probki(sciezka, pozycje):
+    u = UrzadzenieBlokowe(sciezka)
+    buf = mmap.mmap(-1, ROZMIAR_PROBKI)
+    wynik = []
+    try:
+        for p in pozycje:
+            dl = min(ROZMIAR_PROBKI, u.rozmiar - p)
+            try:
+                n = u.czytaj(buf, p, dl)
+                dane = buf[:n]
+                jedn = len(set(dane)) == 1
+                wynik.append({'pozycja': p, 'sha256': hashlib.sha256(dane).hexdigest(), 'jednolita': jedn})
+            except OSError as e:
+                wynik.append({'pozycja': p, 'blad': str(e)})
+    finally:
+        u.zamknij()
+        buf.close()
+    return wynik
+
+
+def zapisz_znaczniki(sciezka, pozycje):
+    """Zapisuje losowe znaczniki w pozycjach próbek i odczytuje je z powrotem (O_DIRECT).
+
+    Po kasowaniu sprzętowym każdy znacznik musi zniknąć — dzięki temu weryfikacja jest informatywna także na dysku,
+    który przed kasowaniem był pusty. Zwraca (lista {pozycja, sha256, jednolita}, odczyt_zgodny: bool).
+    """
+    u = UrzadzenieBlokowe(sciezka, zapis=True)
+    buf = mmap.mmap(-1, ROZMIAR_PROBKI)
+    zapisane = []
+    try:
+        for p in pozycje:
+            dl = min(ROZMIAR_PROBKI, u.rozmiar - p)
+            buf[:dl] = os.urandom(dl)
+            u.pisz(buf, p, dl)
+            zapisane.append({'pozycja': p, 'sha256': hashlib.sha256(buf[:dl]).hexdigest(), 'jednolita': False})
+    finally:
+        u.zamknij()
+        buf.close()
+    uruchom(['blockdev', '--flushbufs', sciezka], timeout=60)
+    odczyt = czytaj_probki(sciezka, pozycje)
+    zgodny = all(o.get('sha256') == z['sha256'] for o, z in zip(odczyt, zapisane))
+    return zapisane, zgodny
+
+
+def ocen_probki(przed, po):
+    """Próbka po kasowaniu OK, gdy jednolita (0x00/0xFF/…) albo różna od stanu przed.
+
+    Identyczna jak przed i niejednolita = dane przetrwały = NIEPOWODZENIE. Błąd odczytu = NIEPOWODZENIE.
+    """
+    mapa = {p['pozycja']: p for p in przed}
+    ok = przetrwaly = bledy = nierozstrz = 0
+    for q in po:
+        if 'blad' in q:
+            bledy += 1
+            continue
+        p = mapa.get(q['pozycja'])
+        if p is None or 'blad' in p:
+            nierozstrz += 1
+            continue
+        if q['sha256'] == p['sha256']:
+            if p['jednolita']:
+                nierozstrz += 1
+            else:
+                przetrwaly += 1
+        else:
+            ok += 1
+    return {'zaliczona': przetrwaly == 0 and bledy == 0 and ok > 0, 'probek': len(po), 'zmienione_lub_jednolite': ok,
+            'identyczne_jak_przed_niejednolite': przetrwaly, 'nierozstrzygniete': nierozstrz, 'bledy_odczytu': bledy}
+
+
+# ---------------------------------------------------------------------------------------------
+# Dziennik operacji (przed każdym poleceniem niszczącym; po starcie widać niedokończone)
+# ---------------------------------------------------------------------------------------------
+def plik_dziennika():
+    if os.path.ismount(MNT_RAPORTY) and os.access(MNT_RAPORTY, os.W_OK):
+        return os.path.join(MNT_RAPORTY, 'operations-log.jsonl')
+    return os.path.join(KATALOG_RUN, 'operations-log.jsonl')
+
+
+def boot_id():
+    return czytaj('/proc/sys/kernel/random/boot_id')
+
+
+def proces_zyje(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+
+
+def dziennik(wpis):
+    # Klucze dziennika (operations-log.jsonl) są stałe i angielskie, jak schemat raportu
+    wpis = dict(wpis, time=teraz_iso(), program=WERSJA, boot_id=boot_id(), pid=os.getpid())
+    try:
+        with open(plik_dziennika(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(wpis, ensure_ascii=False) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        log(f'operations log: write error {e}')
+
+
+def niedokonczone_operacje():
+    otwarte = {}
+    try:
+        for linia in open(plik_dziennika(), encoding='utf-8'):
+            try:
+                w = json.loads(linia)
+            except ValueError:
+                continue
+            if w.get('state') == 'start':
+                otwarte[w['id']] = w
+            elif w.get('state') == 'end':
+                otwarte.pop(w.get('id'), None)
+    except OSError:
+        return []
+    # Operacja z TEGO rozruchu, której proces żyje, jest W TOKU (np. na drugiej konsoli), nie „niedokończona”
+    biez = boot_id()
+    return [w for w in otwarte.values() if not (biez and w.get('boot_id') == biez and proces_zyje(w.get('pid')))]
+
+
+# ---------------------------------------------------------------------------------------------
+# Wykonanie
+# ---------------------------------------------------------------------------------------------
+class Zadanie:
+    def __init__(self, dysk, profil):
+        self.d = dysk
+        self.profil = profil
+        self.etap, self.postep, self.predkosc, self.komunikat = L('oczekuje', 'waiting'), None, None, ''
+        self.wynik = None            # techniczny: OK / UNCONFIRMED / FAILED
+        self.status = None           # końcowy: kod ze STATUSY
+        self.zastrzezenia, self.niepotwierdzone = [], []
+        self.kroki = []
+        self.start = self.koniec = None
+        self.weryfikacja = None
+        self.znaczniki_zgodne = None
+        self.zapisane_b = 0
+        self.watek = None
+
+    def _krok(self, nazwa, rc, opis='', **dod):
+        k = {'nazwa': nazwa, 'rc': rc, 'opis': opis, 'czas': teraz_iso()}
+        k.update(dod)
+        self.kroki.append(k)
+        log(f'{self.d["nazwa"]}: step {nazwa} rc={rc} {opis}')
+        return rc == 0
+
+    def stan(self):
+        return {'dysk': self.d['nazwa'], 'model': self.d.get('model'), 'serial': self.d.get('serial'), 'etap': self.etap,
+                'postep': self.postep, 'predkosc_MBs': self.predkosc, 'komunikat': self.komunikat,
+                'status': self.status, 'technika': self.d.get('plan', {}).get('technika')}
+
+    def _sprawdz_tozsamosc(self):
+        biez = odczytaj_tozsamosc(self.d)
+        if not zgodna_tozsamosc(self.d['tozsamosc'], biez):
+            t, b = self.d['tozsamosc'], biez
+            raise RuntimeError(L(f'ZMIANA TOŻSAMOŚCI DYSKU pod {self.d["sciezka"]}: było S/N {t["serial"]!r}, {t["rozmiar_b"]} B; '
+                                 f'jest S/N {b["serial"]!r}, {b["rozmiar_b"]} B — przerwano',
+                                 f'DISK IDENTITY CHANGED at {self.d["sciezka"]}: was S/N {t["serial"]!r}, {t["rozmiar_b"]} B; '
+                                 f'now S/N {b["serial"]!r}, {b["rozmiar_b"]} B — aborted'))
+
+    def _niszczace(self, technika, haslo_ata=False):
+        """Wpis do dziennika operacji + kontrola tożsamości tuż przed poleceniem niszczącym."""
+        self._sprawdz_tozsamosc()
+        self._id_operacji = f'{self.d.get("serial") or self.d["nazwa"]}-{int(time.time() * 1000)}'
+        dziennik({'id': self._id_operacji, 'state': 'start', 'device': self.d['sciezka'], 'serial': self.d.get('serial'),
+                  'model': self.d.get('model'), 'technique': technika, 'ata_password_set': haslo_ata,
+                  'ata_password': ATA_HASLO if haslo_ata else None})
+
+    def _koniec_operacji(self, wynik):
+        dziennik({'id': getattr(self, '_id_operacji', '?'), 'state': 'end', 'result': wynik})
+
+    def _zapisz_znaczniki(self):
+        """Znaczniki (512 próbek losowych) to ZAPIS na dysk: wpis do dziennika + kontrola tożsamości jak przed każdym niszczącym."""
+        self.etap = L('znaczniki przed kasowaniem', 'markers before erasure')
+        self._niszczace(L('znaczniki przed kasowaniem (próbki losowe)', 'markers before erasure (random samples)'))
+        try:
+            return zapisz_znaczniki(self.d['sciezka'], pozycje_probek(self.d['rozmiar_b']))
+        finally:
+            self._koniec_operacji('markers')
+
+    def _blokada_szyny(self):
+        szyna = self.d.get('szyna')
+        if not szyna:
+            return None
+        with _blokada_szyn:
+            return _blokady_szyn.setdefault(szyna, threading.Lock())
+
+    def _openseachest(self, argumenty, timeout):
+        cmd = ['openSeaChest_Erase', '-d', self.d['sciezka'], '--noBanner'] + argumenty
+        t0 = time.time()
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        zebrane = bytearray()
+        while True:
+            r, _, _ = select.select([p.stdout], [], [], 2)
+            if r:
+                kaw = os.read(p.stdout.fileno(), 4096)
+                if not kaw:
+                    break
+                zebrane += kaw
+                m = re.findall(rb'(\d{1,3}(?:\.\d+)?)\s*%', kaw)
+                if m:
+                    self.postep = min(100.0, float(m[-1]))
+            if time.time() - t0 > timeout:
+                p.kill()
+                break
+        rc = p.wait()
+        tekst = zebrane.decode('utf-8', 'replace')
+        log(f'[{rc}] ({time.time() - t0:.0f}s) {" ".join(cmd)}\n{tekst[-20000:]}', 'commands.log')
+        return rc, tekst
+
+    # --- metody ---
+    def nvme_sanitize(self, akcja):
+        ktrl = self.d['nvme']['kontroler']
+        self._niszczace(f'nvme sanitize sanact={akcja}')
+        rc, out, err = uruchom(['nvme', 'sanitize', ktrl, f'--sanact={akcja}'], timeout=120)
+        if rc != 0:
+            self._koniec_operacji(L('błąd polecenia', 'command error'))
+            return self._krok('nvme-sanitize', rc, (err or out).strip()[:300])
+        t0 = time.time()
+        while time.time() - t0 < 12 * 3600:
+            time.sleep(2)
+            rc2, js, _ = uruchom(['nvme', 'sanitize-log', ktrl, '-o', 'json'], timeout=30)
+            try:
+                v = znajdz_klucze(json.loads(js), {'sprog', 'sstat', 'cdw10_info', 'scdw10'})
+            except ValueError:
+                continue
+            sstat, sprog = int(v.get('sstat', 0)), int(v.get('sprog', 0))
+            self.postep = round(sprog * 100 / 65535, 1)
+            if sstat & 7 in (1, 4):
+                cdw = v.get('cdw10_info', v.get('scdw10'))
+                zgodny = cdw is None or (int(cdw) & 7) == akcja
+                self._koniec_operacji(L('ukończony', 'completed'))
+                self.postep = 100.0
+                if not zgodny:
+                    self.niepotwierdzone.append(L(f'log Sanitize dotyczy innej akcji (SCDW10={cdw})',
+                                                  f'the Sanitize log refers to a different action (SCDW10={cdw})'))
+                return self._krok('nvme-sanitize', 0, L(f'log Sanitize: ukończony, SSTAT=0x{sstat:x}, SCDW10={cdw}',
+                                                        f'Sanitize log: completed, SSTAT=0x{sstat:x}, SCDW10={cdw}'), sstat=sstat)
+            if sstat & 7 == 3:
+                self._koniec_operacji(L('błąd', 'error'))
+                return self._krok('nvme-sanitize', 3, L(f'log Sanitize: NIEPOWODZENIE, SSTAT=0x{sstat:x}',
+                                                        f'Sanitize log: FAILED, SSTAT=0x{sstat:x}'), sstat=sstat)
+        self._koniec_operacji(L('przekroczony czas', 'timeout'))
+        return self._krok('nvme-sanitize', 124, L('przekroczony czas oczekiwania na log Sanitize', 'timed out waiting for the Sanitize log'))
+
+    def nvme_format(self, ses):
+        nv = self.d['nvme']
+        ns = nv.get('ns', {'lbaf': 0, 'ms': 0, 'pi': 0})
+        self._niszczace(f'nvme format ses={ses}')
+        rc, out, err = uruchom(['nvme', 'format', self.d['sciezka'], f'--lbaf={ns["lbaf"]}', f'--ses={ses}', f'--pi={ns["pi"]}',
+                                f'--ms={ns["ms"]}', '--force', '--timeout=3600000'], timeout=3700)
+        uruchom(['nvme', 'ns-rescan', nv['kontroler']], timeout=30)
+        self._koniec_operacji('rc=%d' % rc)
+        if rc == 0:
+            self.postep = 100.0
+        return self._krok('nvme-format', rc, (err or out).strip()[:300])
+
+    def ata_sanitize(self, rodzaj):
+        flaga = {'crypto': '--sanitize-crypto-scramble', 'block': '--sanitize-block-erase', 'overwrite': '--sanitize-overwrite'}[rodzaj]
+        cmd = ['hdparm', '--yes-i-know-what-i-am-doing', flaga] + (['hex:00000000'] if rodzaj == 'overwrite' else []) + [self.d['sciezka']]
+        self._niszczace(f'ATA SANITIZE {rodzaj}')
+        rc, out, err = uruchom(cmd, timeout=120)
+        if rc != 0:
+            self._koniec_operacji(L('błąd polecenia', 'command error'))
+            return self._krok('ata-sanitize', rc, (err or out).strip()[-300:])
+        stan, t0 = 'W_TOKU', time.time()
+        st = ''
+        while time.time() - t0 < 72 * 3600:
+            time.sleep(3)
+            rc2, st, _ = uruchom(['hdparm', '--sanitize-status', self.d['sciezka']], timeout=30)
+            stan, postep = ocen_sanitize_status(st)
+            if postep is not None:
+                self.postep = postep
+            if stan != 'W_TOKU':
+                break
+        self._koniec_operacji(KODY_WYNIKU.get(stan, stan))
+        if stan == 'NIEZNANY':
+            self.niepotwierdzone.append(L('status SANITIZE nieczytelny po operacji', 'SANITIZE status unreadable after the operation'))
+            return self._krok('ata-sanitize', 0, L(f'{rodzaj}; status nieczytelny: {st.strip()[-200:]}',
+                                                   f'{rodzaj}; status unreadable: {st.strip()[-200:]}'))
+        return self._krok('ata-sanitize', 0 if stan == 'OK' else 3, f'{rodzaj}; status: {st.strip()[-200:]}')
+
+    def ata_security_erase(self, enhanced):
+        sc = self.d['sciezka']
+        b = self.d['ata']['bezpieczenstwo']
+        szac = (b.get('czas_enh_min') if enhanced else b.get('czas_min')) or 120
+        stop = threading.Event()
+
+        def postep_czasowy():
+            t0 = time.time()
+            while not stop.wait(5):
+                self.postep = min(99.0, round((time.time() - t0) / (szac * 60) * 100, 1))
+                self.komunikat = L(f'szacowany czas wg dysku: {szac} min', f'estimated time reported by the drive: {szac} min')
+        self._niszczace('ATA SECURITY ERASE ' + ('enhanced' if enhanced else 'normal'), haslo_ata=True)
+        rc, out, err = uruchom(['hdparm', '--user-master', 'u', '--security-set-pass', ATA_HASLO, sc], timeout=60)
+        if rc != 0:
+            self._koniec_operacji(L('nie ustawiono hasła', 'password not set'))
+            return self._krok('ata-security-set-pass', rc, (err or out).strip()[-300:])
+        threading.Thread(target=postep_czasowy, daemon=True).start()
+        rc, out, err = uruchom(['hdparm', '--user-master', 'u', '--security-erase-enhanced' if enhanced else '--security-erase',
+                                ATA_HASLO, sc], timeout=max(szac * 60 * 3, 3600) + 1800)
+        stop.set()
+        time.sleep(2)
+        rc2, tekst, _ = uruchom(['hdparm', '-I', sc], timeout=60)
+        a = parsuj_hdparm_I(tekst)
+        if a and (a['bezpieczenstwo'].get('wlaczone') or a['bezpieczenstwo'].get('zablokowane')):
+            uruchom(['hdparm', '--user-master', 'u', '--security-unlock', ATA_HASLO, sc], timeout=60)
+            uruchom(['hdparm', '--user-master', 'u', '--security-disable', ATA_HASLO, sc], timeout=60)
+            rc2, tekst, _ = uruchom(['hdparm', '-I', sc], timeout=60)
+        wynik, opis = ocen_po_security_erase(rc, tekst, self.d['tozsamosc']['serial'])
+        self._koniec_operacji(KODY_WYNIKU.get(wynik, wynik))
+        if wynik == 'UNCONFIRMED':
+            self.niepotwierdzone.append(opis)
+            return self._krok('ata-security-erase', 0, opis)
+        if wynik == 'OK':
+            self.postep = 100.0
+        else:
+            opis += L(f'. Odblokowanie ręczne: hdparm --user-master u --security-disable {ATA_HASLO} {sc}',
+                      f'. Manual unlock: hdparm --user-master u --security-disable {ATA_HASLO} {sc}')
+        return self._krok('ata-security-erase', 0 if wynik == 'OK' else 3, opis)
+
+    def scsi_sanitize(self, rodzaj):
+        arg = {'crypto': 'cryptoerase', 'block': 'blockerase', 'overwrite': 'overwrite'}[rodzaj]
+        self._niszczace(f'SCSI SANITIZE {rodzaj}')
+        rc, out = self._openseachest(['--sanitize', arg, '--poll'], timeout=72 * 3600)
+        self._koniec_operacji('rc=%d' % rc)
+        return self._krok('scsi-sanitize', rc, arg)
+
+    def przywroc_max_lba(self):
+        rc, out = self._openseachest(['--eraseRestoreMaxPrep'], timeout=300)
+        rescan = f'/sys/block/{self.d["nazwa"]}/device/rescan'
+        if os.path.exists(rescan):
+            try:
+                with open(rescan, 'w') as f:
+                    f.write('1')
+            except OSError:
+                pass
+        time.sleep(2)
+        nowy = rozmiar_urzadzenia(self.d['sciezka'])
+        rc2, tekst, _ = uruchom(['hdparm', '-I', self.d['sciezka']], timeout=30)
+        a = parsuj_hdparm_I(tekst)
+        if a:
+            self.d['ata']['sektory'] = a['sektory']
+            self.d['rozmiar_identify_b'] = a['sektory'] * a['sektor_logiczny']
+        self.d['rozmiar_urzadzenia_b'] = nowy
+        self.d['tozsamosc']['rozmiar_b'] = nowy
+        return self._krok('restore-max-lba', rc, L(f'HPA/DCO/AMAC; rozmiar urządzenia po: {nowy} B',
+                                                   f'HPA/DCO/AMAC; device size afterwards: {nowy} B'))
+
+    def nadpis(self, wzorzec):  # wzorzec: 'zeros' | 'random'
+        self._niszczace(L(f'nadpis ({wzorzec})', f'overwrite ({wzorzec})'))
+        u = UrzadzenieBlokowe(self.d['sciezka'], zapis=True)
+        buf = mmap.mmap(-1, ROZMIAR_BLOKU_IO)
+        rozm, bledy, poz, t0 = u.rozmiar, 0, 0, time.time()
+        gen = random.Random(random.SystemRandom().getrandbits(64))
+        try:
+            while poz < rozm:
+                dl = min(ROZMIAR_BLOKU_IO, rozm - poz)
+                if wzorzec == 'random':
+                    buf[:dl] = gen.randbytes(dl)
+                try:
+                    zap = self._zapis_bloku(u, buf, poz, dl)
+                    if zap != dl:
+                        bledy += 1
+                except OSError as e:
+                    bledy += 1
+                    log(f'{self.d["nazwa"]}: write error @ {poz}: {e}')
+                    if bledy > 100:
+                        break
+                poz += dl
+                dt = time.time() - t0
+                self.postep = round(poz * 100 / rozm, 1)
+                self.predkosc = round(poz / dt / 1e6, 1) if dt > 0 else None
+        finally:
+            u.zamknij()
+            buf.close()
+        uruchom(['blockdev', '--flushbufs', self.d['sciezka']], timeout=60)
+        self.zapisane_b = poz
+        self._koniec_operacji(L(f'zapisano {poz} B, błędy {bledy}', f'written {poz} B, errors {bledy}'))
+        rc = 0 if bledy == 0 and poz >= rozm else 3
+        return self._krok(f'overwrite-{wzorzec}', rc, L(f'{wzorzec}, {poz} z {rozm} B, błędy zapisu: {bledy}, O_DIRECT={u.direct}',
+                                                        f'{wzorzec}, {poz} of {rozm} B, write errors: {bledy}, O_DIRECT={u.direct}'),
+                          zapisane_b=poz, rozmiar_b=rozm, bledy=bledy)
+
+    def _zapis_bloku(self, u, buf, poz, dl):  # osobna metoda: test „dysku-oszusta” podmienia ją w tests/
+        return u.pisz(buf, poz, dl)
+
+    def mmc_discard_sanitize(self):
+        self._niszczace('eMMC discard + sanitize')
+        rc1, o1, e1 = uruchom(['blkdiscard', '-f', self.d['sciezka']], timeout=3600)
+        rc2, o2, e2 = uruchom(['mmc', 'sanitize', self.d['sciezka']], timeout=3600)
+        self._koniec_operacji(f'discard rc={rc1}, sanitize rc={rc2}')
+        self._krok('mmc-discard', rc1, (e1 or o1).strip()[:200])
+        self._krok('mmc-sanitize', rc2, (e2 or o2).strip()[:200])
+        if rc2 != 0:
+            self.zastrzezenia.append(L('eMMC SANITIZE niewykonany (brak obsługi?) — zostaje discard + nadpis',
+                                       'eMMC SANITIZE not performed (unsupported?) — discard + overwrite remain'))
+        return self.nadpis('zeros')
+
+    def weryfikuj_zera(self):
+        self.etap = L('weryfikacja (pełny odczyt)', 'verification (full read-back)')
+        u = UrzadzenieBlokowe(self.d['sciezka'])
+        buf = mmap.mmap(-1, ROZMIAR_BLOKU_IO)
+        zero = bytes(ROZMIAR_BLOKU_IO)
+        rozm, poz, niezerowe, bledy, t0, pierwszy = u.rozmiar, 0, 0, 0, time.time(), None
+        try:
+            while poz < rozm:
+                dl = min(ROZMIAR_BLOKU_IO, rozm - poz)
+                try:
+                    n = u.czytaj(buf, poz, dl)
+                    if n != dl or buf[:n] != zero[:n]:
+                        niezerowe += 1
+                        pierwszy = poz if pierwszy is None else pierwszy
+                except OSError:
+                    bledy += 1
+                poz += dl
+                dt = time.time() - t0
+                self.postep = round(poz * 100 / rozm, 1)
+                self.predkosc = round(poz / dt / 1e6, 1) if dt > 0 else None
+        finally:
+            u.zamknij()
+            buf.close()
+        return {'metoda': L('pełny odczyt, każdy bajt = 0x00', 'full read-back, every byte = 0x00'), 'zweryfikowane_b': poz, 'rozmiar_b': rozm,
+                'bloki_4MiB_niezerowe': niezerowe, 'bledy_odczytu': bledy, 'pierwszy_niezerowy_offset': pierwszy,
+                'zaliczona': niezerowe == 0 and bledy == 0 and poz >= rozm}
+
+    def weryfikuj_znaczniki(self, znaczniki):
+        self.etap = L('weryfikacja (znaczniki)', 'verification (markers)')
+        po = czytaj_probki(self.d['sciezka'], [p['pozycja'] for p in znaczniki])
+        w = ocen_probki(znaczniki, po)
+        w['metoda'] = L(f'znaczniki: {len(po)} × {ROZMIAR_PROBKI // 1024} KiB losowych danych zapisanych przed kasowaniem',
+                        f'markers: {len(po)} × {ROZMIAR_PROBKI // 1024} KiB of random data written before erasure')
+        w['zweryfikowane_b'] = len(po) * ROZMIAR_PROBKI
+        rc, out, _ = uruchom(['wipefs', '-n', '-J', self.d['sciezka']], timeout=30)
+        try:
+            sygn = json.loads(out).get('signatures', []) if out.strip() else []
+        except ValueError:
+            sygn = []
+        w['sygnatury_po'] = [s.get('type') for s in sygn]
+        if sygn:
+            w['zaliczona'] = False
+        return w
+
+    # --- przebieg ---
+    def wykonaj(self):
+        self.start = teraz_iso()
+        plan = self.d['plan']
+        try:
+            if 'restore-max-lba' in plan['przygotowanie']:
+                self.etap = L('przywracanie ukrytego obszaru (HPA/DCO)', 'restoring the hidden area (HPA/DCO)')
+                self._niszczace(L('przywrócenie pełnego rozmiaru (HPA/DCO/AMAC)', 'restoring the full capacity (HPA/DCO/AMAC)'))
+                try:
+                    przywrocone = self.przywroc_max_lba()
+                finally:
+                    self._koniec_operacji('HPA/DCO')
+                if not przywrocone:
+                    if plan['kroki'][0].startswith('overwrite'):
+                        raise RuntimeError(L('Nie udało się przywrócić pełnego rozmiaru (HPA/DCO) — nadpis nie obejmie całego dysku',
+                                             'Could not restore the full capacity (HPA/DCO) — an overwrite would not cover the whole disk'))
+                    # Nadpis przez hosta obejmuje tylko widoczny rozmiar — nie może też być rezerwą metody firmware
+                    plan['zapasowe'] = [m for m in plan.get('zapasowe', []) if METODY[m][3] != 'host']
+                    self.zastrzezenia.append(L('HPA/DCO nie przywrócone — polega na tym, że metoda firmware obejmuje cały nośnik',
+                                               'HPA/DCO not restored — relies on the firmware method covering the whole medium'))
+            znaczniki = None
+            for i, k in enumerate(list(plan['kroki'])):
+                sprzetowy = METODY[k][3] != 'host' and k != 'mmc-discard-sanitize'
+                if sprzetowy:
+                    znaczniki, self.znaczniki_zgodne = self._zapisz_znaczniki()
+                    if not self.znaczniki_zgodne:
+                        self.zastrzezenia.append(L('znaczniki nie odczytały się zgodnie przed kasowaniem — weryfikacja mniej informatywna',
+                                                   'markers did not read back correctly before erasure — verification is less informative'))
+                ok = self._z_blokada(k)
+                if not ok and not self.niepotwierdzone:
+                    for zap in [z for z in plan.get('zapasowe', []) if z not in plan['kroki']]:
+                        log(f'{self.d["nazwa"]}: {k} failed → fallback method {zap}')
+                        if METODY[zap][3] != 'host' and zap != 'mmc-discard-sanitize':
+                            znaczniki, self.znaczniki_zgodne = self._zapisz_znaczniki()
+                        else:
+                            znaczniki = None
+                        ok = self._z_blokada(zap)
+                        if ok:
+                            plan['kroki'][i] = zap
+                            uzupelnij_plan(plan, self.d)
+                            plan['uwagi'].append(L(f'Metoda {METODY[k][1]} zawiodła — użyto zapasowej: {METODY[zap][1]}',
+                                                   f'Method {METODY[k][1]} failed — fallback used: {METODY[zap][1]}'))
+                            break
+                if not ok and not self.niepotwierdzone:
+                    raise RuntimeError(L(f'Metoda {METODY[k][1]} i metody zapasowe zakończone błędem',
+                                         f'Method {METODY[k][1]} and the fallback methods failed'))
+            uruchom(['blockdev', '--rereadpt', self.d['sciezka']], timeout=30)
+            if plan['kroki'][-1] in ('overwrite-zeros', 'mmc-discard-sanitize'):
+                self.weryfikacja = self.weryfikuj_zera()
+            else:
+                self.weryfikacja = self.weryfikuj_znaczniki(znaczniki)
+            w = self.weryfikacja
+            przetrwaly = ((w.get('identyczne_jak_przed_niejednolite') or 0) > 0 or (w.get('bloki_4MiB_niezerowe') or 0) > 0
+                          or bool(w.get('sygnatury_po')))
+            if przetrwaly:  # dowód, że dane przetrwały, ma pierwszeństwo przed stanem „niepotwierdzonym”
+                self.wynik = 'FAILED'
+                self.komunikat = self.komunikat or L('weryfikacja: dane przetrwały kasowanie', 'verification: data survived the erasure')
+            else:
+                self.wynik = 'UNCONFIRMED' if self.niepotwierdzone else ('OK' if w.get('zaliczona') else 'FAILED')
+        except Exception as e:  # noqa: BLE001 — każdy błąd = FAILED w raporcie, nie wywrotka programu
+            self.komunikat = str(e)
+            self.wynik = 'FAILED'
+            log(f'{self.d["nazwa"]}: FAILED: {e}')
+        finally:
+            self.etap = L('SMART po', 'SMART after')
+            self.d['smart_po'], self.d['smart_po_surowy'] = smart_json(self.d['sciezka'], self.d.get('transport'))
+            self.koniec = teraz_iso()
+            self.status = ustal_status(self)
+            self.etap = L('zakończone', 'finished')
+            log(f'{self.d["nazwa"]}: STATUS {self.status}')
+
+    def _z_blokada(self, k):
+        self.etap = METODY[k][1]
+        self.postep, self.predkosc, self.komunikat = 0.0, None, ''
+        blok = self._blokada_szyny() if METODY[k][3] != 'host' else None
+        if blok:
+            self.komunikat = L(f'czeka na mostek USB {self.d.get("szyna")}', f'waiting for USB bridge {self.d.get("szyna")}')
+            with blok:
+                return self._wykonaj_metode(k)
+        return self._wykonaj_metode(k)
+
+    def _wykonaj_metode(self, k):
+        if k.startswith('nvme-sanitize-'):
+            return self.nvme_sanitize({'crypto': 4, 'block': 2, 'overwrite': 3}[k.rsplit('-', 1)[1]])
+        if k == 'nvme-format-crypto':
+            return self.nvme_format(2)
+        if k == 'nvme-format-user':
+            return self.nvme_format(1)
+        if k.startswith('ata-sanitize-'):
+            return self.ata_sanitize(k.rsplit('-', 1)[1])
+        if k == 'ata-se-enhanced':
+            return self.ata_security_erase(True)
+        if k == 'ata-se-normal':
+            return self.ata_security_erase(False)
+        if k.startswith('scsi-sanitize-'):
+            return self.scsi_sanitize(k.rsplit('-', 1)[1])
+        if k == 'mmc-discard-sanitize':
+            return self.mmc_discard_sanitize()
+        if k == 'overwrite-zeros':
+            return self.nadpis('zeros')
+        if k == 'overwrite-random':
+            return self.nadpis('random')
+        raise ValueError(k)
+
+
+def ustal_status(z):
+    """Status końcowy (kod ze STATUSY) + lista zastrzeżeń (z.zastrzezenia uzupełniane)."""
+    d, plan = z.d, z.d.get('plan', {})
+    if z.wynik == 'FAILED' or z.wynik is None:
+        return 'FAILED'
+    ident, urz = d.get('rozmiar_identify_b'), d.get('rozmiar_urzadzenia_b')
+    if ident and urz and ident != urz:
+        z.niepotwierdzone.append(L(f'rozmiar wg IDENTIFY {ident} B ≠ rozmiar urządzenia {urz} B',
+                                   f'IDENTIFY size {ident} B ≠ device size {urz} B'))
+    if plan.get('klasa') == 'NONE':
+        z.niepotwierdzone.append(L('zakres kasowania niepotwierdzony (brak IDENTIFY / wolumen RAID sprzętowego)',
+                                   'erase range unconfirmed (no IDENTIFY / hardware RAID volume)'))
+    if z.wynik == 'UNCONFIRMED' or z.niepotwierdzone:
+        return 'UNCONFIRMED'
+    kroki = plan.get('kroki', [])
+    tylko_host = all(METODY[k][3] == 'host' for k in kroki)
+    if tylko_host and d.get('typ_nosnika') in ('SSD', 'NVMe SSD', 'eMMC', 'unknown'):
+        z.zastrzezenia.append(L('nośnik flash skasowany tylko nadpisem — zapas komórek nieobjęty (NIST SP 800-88r2 §4.5.2)',
+                                'flash media erased by overwrite only — spare cells not covered (NIST SP 800-88r2 §4.5.2)'))
+    if tylko_host and (d.get('smart_przed', {}).get('realokowane') or 0) > 0:
+        z.zastrzezenia.append(L(f'{d["smart_przed"]["realokowane"]} sektorów realokowanych — nadpis ich nie obejmuje',
+                                f'{d["smart_przed"]["realokowane"]} reallocated sectors — not covered by the overwrite'))
+    if d.get('serial_zrodlo') == 'usb-bridge':
+        z.zastrzezenia.append(L('numer seryjny pochodzi z mostka USB, nie z dysku', 'serial number comes from the USB bridge, not the drive'))
+    z.zastrzezenia += pogorszenie_smart(d.get('smart_przed', {}), d.get('smart_po', {}))
+    return 'ERASED_WITH_WARNINGS' if z.zastrzezenia else 'ERASED'
+
+
+def odmroz_dyski(zadania):
+    """Uśpienie S3 na kilka sekund PRZED pierwszą operacją niszczącą. Po wybudzeniu: ponowna kontrola stanu i tożsamości."""
+    do = [z for z in zadania if 'unfreeze' in z.d['plan']['przygotowanie']]
+    if not do:
+        return
+    stany = czytaj('/sys/power/state')
+    log(f'unfreeze: {", ".join(z.d["nazwa"] for z in do)}; /sys/power/state="{stany}" mem_sleep="{czytaj("/sys/power/mem_sleep")}"')
+    if 'mem' in stany:
+        print(L('Usypiam komputer na ~5 s, żeby odmrozić dyski (frozen). Jeśli sam się nie obudzi — naciśnij zasilanie.',
+                'Suspending the computer for ~5 s to unfreeze the drives. If it does not wake up by itself, press the power button.'))
+        uruchom(['rtcwake', '-m', 'mem', '-s', '5'], timeout=180)
+        time.sleep(8)
+    for z in zadania:  # po uśpieniu nazwy urządzeń mogą się przetasować — kontrola tożsamości WSZYSTKICH
+        if not zgodna_tozsamosc(z.d['tozsamosc'], odczytaj_tozsamosc(z.d)):
+            z.d['plan']['mozliwe'] = False
+            z.d['plan']['uwagi'].append(L('Po uśpieniu pod tą ścieżką jest inny dysk — pominięty, uruchom program ponownie',
+                                          'After suspend a different disk is at this path — skipped, run the program again'))
+    for z in do:
+        rc, tekst, _ = uruchom(['hdparm', '-I', z.d['sciezka']], timeout=30)
+        a = parsuj_hdparm_I(tekst)
+        if a:
+            z.d['ata']['bezpieczenstwo'] = a['bezpieczenstwo']
+        zamr = z.d['ata']['bezpieczenstwo'].get('zamrozone')
+        z.d['plan']['odmrozenie_wynik'] = L('odmrożony', 'unfrozen') if zamr is False else L('nadal zamrożony', 'still frozen')
+        if zamr:
+            stare = list(z.d['plan']['kroki'])
+            nowe = [k for k in z.d['plan']['zapasowe'] if not k.startswith('ata-se')]
+            z.d['plan']['kroki'] = [k for k in stare if not k.startswith('ata-se')] + (nowe[:1] if not any(not k.startswith('ata-se') and METODY[k][3] != 'host' for k in stare) else [])
+            if not z.d['plan']['kroki']:
+                z.d['plan']['kroki'] = ['overwrite-zeros']
+            z.d['plan']['uwagi'].append(L(
+                'Nie udało się odmrozić (frozen) — Security Erase pominięty. Ręcznie: odłącz i podłącz zasilanie dysku przy '
+                'włączonym komputerze (hot-plug) albo użyj innego komputera.',
+                'Could not unfreeze the drive — Security Erase skipped. Manually: unplug and replug the drive power while the '
+                'computer is on (hot-plug), or use another computer.'))
+            uzupelnij_plan(z.d['plan'], z.d)
+
+
+def pokaz_postep(zadania, plik_stanu):
+    wiersze = []
+    for z in zadania:
+        s = z.stan()
+        post = f'{s["postep"]:5.1f}%' if isinstance(s['postep'], (int, float)) else '   — '
+        pr = f'{s["predkosc_MBs"]:.0f} MB/s' if s['predkosc_MBs'] else ''
+        wiersze.append(f' {s["dysk"]:<9} {str(s["model"])[:22]:<22} {post} {pr:>9}  {s["etap"][:42]:<42} {kod(s["status"]) if s["status"] else ""}')
+    sys.stdout.write('\033[2J\033[H' + f'ShamanWipe {WERSJA} — ' + L('kasowanie w toku', 'erasure in progress') +
+                     f' ({teraz().strftime("%H:%M:%S")})\n\n' +
+                     L(' DYSK      MODEL                  POSTĘP  PRĘDKOŚĆ  ETAP\n', ' DISK      MODEL                  PROG.      SPEED  STAGE\n') +
+                     '\n'.join(wiersze) +
+                     L('\n\nNIE wyłączaj komputera i NIE odłączaj dysków do końca.\n',
+                       '\n\nDo NOT power off the computer or disconnect any disk until finished.\n'))
+    sys.stdout.flush()
+    try:
+        with open(plik_stanu + '.tmp', 'w') as f:
+            json.dump([z.stan() for z in zadania], f, ensure_ascii=False)
+        os.replace(plik_stanu + '.tmp', plik_stanu)
+    except OSError:
+        pass
+
+
+def kasuj(dyski, profil):
+    zadania = [Zadanie(d, profil) for d in dyski if d.get('plan', {}).get('mozliwe')]
+    odmroz_dyski(zadania)
+    zadania = [z for z in zadania if z.d['plan'].get('mozliwe')]
+    t_start = teraz_iso()
+    for z in zadania:
+        z.watek = threading.Thread(target=z.wykonaj, daemon=True)
+        z.watek.start()
+    plik_stanu = os.path.join(KATALOG_RUN, 'stan.json')
+    while any(z.watek.is_alive() for z in zadania):
+        pokaz_postep(zadania, plik_stanu)
+        time.sleep(2)
+    pokaz_postep(zadania, plik_stanu)
+    return zadania, t_start
+
+
+# ---------------------------------------------------------------------------------------------
+# Raport
+# ---------------------------------------------------------------------------------------------
+def dane_systemu():
+    def dmi(k):
+        rc, out, _ = uruchom(['dmidecode', '-s', k], timeout=20)
+        return out.strip() if rc == 0 else ''
+    cpu = next((l.split(':', 1)[1].strip() for l in czytaj('/proc/cpuinfo').splitlines() if l.startswith('model name')), '')
+    pamiec = next((int(l.split()[1]) * 1024 for l in czytaj('/proc/meminfo').splitlines() if l.startswith('MemTotal')), 0)
+    wersje = {}
+    for p in ('openseachest', 'nvme-cli', 'hdparm', 'sg3-utils', 'smartmontools', 'nwipe', 'mmc-utils', 'util-linux'):
+        rc, out, _ = uruchom(['dpkg-query', '-W', '-f', '${Version}', p], timeout=20)
+        wersje[p] = out.strip() if rc == 0 else 'missing'
+    rc, sync, _ = uruchom(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'], timeout=10)
+    rc, lspci, _ = uruchom(['lspci'], timeout=20)
+    return {'producent': dmi('system-manufacturer'), 'model': dmi('system-product-name'),
+            'numer_seryjny': dmi('system-serial-number'), 'uuid': dmi('system-uuid'),
+            'plyta_glowna': f"{dmi('baseboard-manufacturer')} {dmi('baseboard-product-name')}".strip(),
+            'procesor': cpu, 'pamiec_b': pamiec, 'czas_z_ntp': sync.strip() == 'yes', 'strefa': time.strftime('%Z'),
+            'rozruch': 'UEFI' if os.path.isdir('/sys/firmware/efi') else 'BIOS',
+            'kontrolery_raid': [l for l in lspci.splitlines() if re.search(r'RAID bus controller|Volume Management Device', l)],
+            'narzedzia': wersje, 'program': f'shamanwipe {WERSJA}', 'jadro': os.uname().release}
+
+
+def czytaj_operatora():
+    # operator.conf na SW-REPORTS: name=, title=, organization=, location=, contact= (pola NIST SP 800-88r2 §4.6)
+    op = {'name': '', 'title': '', 'organization': '', 'location': '', 'contact': ''}
+    for linia in czytaj(os.path.join(MNT_RAPORTY, 'operator.conf')).splitlines():
+        if '=' in linia and not linia.strip().startswith('#'):
+            k, v = linia.split('=', 1)
+            if k.strip() in op:
+                op[k.strip()] = v.strip()
+    return op
+
+
+POLA_SMART = ('zdrowie', 'godziny_pracy', 'realokowane', 'oczekujace', 'nienaprawialne', 'zuzycie_proc', 'bledy_nosnika', 'temperatura')
+
+
+def wiersz_dysku(z):
+    d, p = z.d, z.d.get('plan', {})
+    uwagi = p.get('uwagi', []) + p.get('uwagi_metody', [])
+    if p.get('niezweryfikowane_na_sprzecie'):
+        uwagi.append(L('Technika niezweryfikowana w ShamanWipe na sprzęcie tej klasy (', 'Technique not yet verified in ShamanWipe '
+                       'on hardware of this class (') + ', '.join(p['niezweryfikowane_na_sprzecie']) + ')')
+    if z.komunikat:
+        uwagi.append(z.komunikat)
+    w = z.weryfikacja or {}
+    return {'urzadzenie': d['sciezka'], 'producent': d.get('vendor') or (d.get('model') or '').split(' ')[0],
+            'model': d.get('model'), 'numer_seryjny': d.get('serial'), 'zrodlo_numeru': d.get('serial_zrodlo'),
+            'firmware': d.get('firmware'), 'wwn': d.get('wwn'),
+            'typ_nosnika': d.get('typ_nosnika'), 'interfejs': f"{d.get('interfejs')} / {d.get('transport') or '-'}",
+            'zawartosc_przed': d.get('zawartosc'),
+            'rozmiar_identify_b': d.get('rozmiar_identify_b'), 'rozmiar_urzadzenia_b': d.get('rozmiar_urzadzenia_b') or d.get('rozmiar_b'),
+            'zapisane_b': z.zapisane_b or None, 'zweryfikowane_b': w.get('zweryfikowane_b'),
+            'metoda_nist': p.get('klasa', 'NONE'), 'technika': p.get('technika'), 'klasyfikacja_zrodlo': ZRODLO_KLASYFIKACJI,
+            'odmrozenie': p.get('odmrozenie_wynik'), 'weryfikacja': z.weryfikacja,
+            'status': z.status, 'zastrzezenia': z.zastrzezenia, 'niepotwierdzone': z.niepotwierdzone, 'uwagi': uwagi,
+            'start': z.start, 'koniec': z.koniec, 'kroki': z.kroki,
+            'smart_przed': {k: d.get('smart_przed', {}).get(k) for k in POLA_SMART},
+            'smart_po': {k: d.get('smart_po', {}).get(k) for k in POLA_SMART}}
+
+
+# Schemat raportu: klucze wewnętrzne → stałe klucze angielskie (JSON, XML; CSV ma własny nagłówek). Słowniki pod kluczami
+# z DANE_BEZ_ZMIAN to dane (nazwy pakietów, kody statusów), nie schemat — przechodzą bez zmian.
+KLUCZE_RAPORTU = {
+    'utworzono': 'created', 'rozpoczeto': 'started', 'tryb': 'mode', 'profil': 'profile', 'opis_profilu': 'profile_description',
+    'numer_srodka': 'asset_number', 'dyski': 'disks', 'nic_nie_skasowano': 'nothing_erased', 'podsumowanie': 'summary',
+    'pominiete': 'skipped', 'podpis': 'signature', 'jezyk': 'language',
+    'producent': 'manufacturer', 'numer_seryjny': 'serial_number', 'plyta_glowna': 'baseboard', 'procesor': 'cpu',
+    'pamiec_b': 'memory_bytes', 'czas_z_ntp': 'time_from_ntp', 'strefa': 'timezone', 'rozruch': 'boot_mode',
+    'kontrolery_raid': 'raid_controllers', 'narzedzia': 'tools', 'jadro': 'kernel',
+    'urzadzenie': 'device', 'zrodlo_numeru': 'serial_source', 'typ_nosnika': 'media_type', 'interfejs': 'interface',
+    'zawartosc_przed': 'content_before', 'rozmiar_identify_b': 'identify_size_bytes',
+    'rozmiar_urzadzenia_b': 'device_size_bytes', 'zapisane_b': 'bytes_written', 'zweryfikowane_b': 'bytes_verified',
+    'metoda_nist': 'nist_method', 'technika': 'technique', 'klasyfikacja_zrodlo': 'classification_basis',
+    'odmrozenie': 'unfreeze', 'weryfikacja': 'verification', 'zastrzezenia': 'warnings', 'niepotwierdzone': 'unconfirmed',
+    'uwagi': 'notes', 'koniec': 'end', 'kroki': 'steps', 'smart_przed': 'smart_before', 'smart_po': 'smart_after',
+    'powod': 'reason', 'metoda': 'method', 'rozmiar_b': 'size_bytes', 'bloki_4MiB_niezerowe': 'nonzero_4mib_blocks',
+    'bledy_odczytu': 'read_errors', 'pierwszy_niezerowy_offset': 'first_nonzero_offset', 'zaliczona': 'passed',
+    'probek': 'samples', 'zmienione_lub_jednolite': 'changed_or_uniform',
+    'identyczne_jak_przed_niejednolite': 'unchanged_nonuniform', 'nierozstrzygniete': 'inconclusive',
+    'sygnatury_po': 'signatures_after', 'nazwa': 'name', 'opis': 'detail', 'czas': 'time', 'bledy': 'errors',
+    'zdrowie': 'health_passed', 'godziny_pracy': 'power_on_hours', 'realokowane': 'reallocated', 'oczekujace': 'pending',
+    'nienaprawialne': 'uncorrectable', 'zuzycie_proc': 'percentage_used', 'bledy_nosnika': 'media_errors',
+    'temperatura': 'temperature', 'podpisany': 'signed', 'odcisk_klucza': 'key_fingerprint', 'stan': 'state',
+}
+KLUCZE_STALE = {'id', 'program', 'operator', 'system', 'model', 'uuid', 'firmware', 'wwn', 'status', 'start', 'rc', 'sstat',
+                'name', 'title', 'organization', 'location', 'contact'}
+DANE_BEZ_ZMIAN = {'narzedzia', 'podsumowanie'}
+
+
+def raport_eksport(obj):
+    """Kopia raportu ze stałymi kluczami angielskimi (wartości bez zmian)."""
+    if isinstance(obj, dict):
+        return {KLUCZE_RAPORTU.get(k, k): (v if k in DANE_BEZ_ZMIAN else raport_eksport(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [raport_eksport(v) for v in obj]
+    return obj
+
+
+def klucze_spoza_schematu(obj, sciezka=''):
+    """Klucze wyeksportowanego raportu spoza schematu (kontrola testów: żaden klucz wewnętrzny nie wycieka)."""
+    dozwolone = set(KLUCZE_RAPORTU.values()) | KLUCZE_STALE
+    zle = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k not in dozwolone:
+                zle.append(f'{sciezka}/{k}')
+            if k == 'summary':
+                zle += [f'{sciezka}/summary/{s}' for s in v if s not in STATUSY]
+            elif k != 'tools':
+                zle += klucze_spoza_schematu(v, f'{sciezka}/{k}')
+    elif isinstance(obj, list):
+        for v in obj:
+            zle += klucze_spoza_schematu(v, sciezka)
+    return zle
+
+
+def katalog_raportow():
+    if os.path.ismount(MNT_RAPORTY) and os.access(MNT_RAPORTY, os.W_OK):
+        return os.path.join(MNT_RAPORTY, 'reports'), True
+    return os.path.join(KATALOG_RUN, 'reports'), False
+
+
+def dict_do_xml(rodzic, klucz, wartosc):
+    tag = re.sub(r'[^A-Za-z0-9_]', '_', str(klucz)) or 'pole'
+    tag = 'p_' + tag if tag[0].isdigit() else tag
+    el = ET.SubElement(rodzic, tag)
+    if isinstance(wartosc, dict):
+        for k, v in wartosc.items():
+            dict_do_xml(el, k, v)
+    elif isinstance(wartosc, list):
+        for v in wartosc:
+            dict_do_xml(el, 'element', v)
+    else:
+        el.text = '' if wartosc is None else str(wartosc)
+
+
+def pisz_pdf(sciezka, raport):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, PageBreak
+    except ImportError:
+        log('reportlab missing — PDF skipped')
+        return False
+    pdfmetrics.registerFont(TTFont('DV', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+    pdfmetrics.registerFont(TTFont('DVB', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
+    st = ParagraphStyle('n', fontName='DV', fontSize=8.5, leading=11)
+    stb = ParagraphStyle('b', fontName='DVB', fontSize=9, leading=12)
+    h1 = ParagraphStyle('h1', fontName='DVB', fontSize=15, leading=19, spaceAfter=4)
+    h2 = ParagraphStyle('h2', fontName='DVB', fontSize=11, leading=14, spaceBefore=8, spaceAfter=4)
+    alarm = ParagraphStyle('a', fontName='DVB', fontSize=10, leading=13, textColor=colors.red)
+
+    def P(t, s=st):
+        return Paragraph(str(t if t not in (None, '') else '—').replace('&', '&amp;').replace('<', '&lt;').replace('\n', '<br/>'), s)
+
+    def tabela(wiersze, szer=(55 * mm, 125 * mm)):
+        t = Table([[P(a, stb), P(b)] for a, b in wiersze], colWidths=szer)
+        t.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 0.3, colors.grey), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                               ('BACKGROUND', (0, 0), (0, -1), colors.whitesmoke)]))
+        return t
+
+    s, op, pod = raport['system'], raport['operator'], raport['podpis']
+    tytul = L('Certyfikat kasowania danych (Certificate of Sanitization)', 'Certificate of Sanitization')
+    naglowek = P(tytul, h1)
+    if os.path.exists(LOGO):  # logo projektowane na ciemne tło — na białej stronie stoi na ciemnym kafelku
+        from reportlab.platypus import Image
+        kafel = Table([[Image(LOGO, width=16 * mm, height=16 * mm * 183 / 199)]], colWidths=(20 * mm,), rowHeights=(19 * mm,))
+        kafel.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#111111')), ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                                   ('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
+        naglowek = Table([[kafel, P(tytul, h1)]], colWidths=(24 * mm, 156 * mm))
+        naglowek.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('LEFTPADDING', (0, 0), (0, 0), 0)]))
+    el = [naglowek,
+          P(L(f'Raport {raport["id"]} · {raport["utworzono"]} · {raport["program"]} · tryb: {kod(raport["tryb"])}, profil: {raport["profil"]}',
+              f'Report {raport["id"]} · {raport["utworzono"]} · {raport["program"]} · mode: {kod(raport["tryb"])}, profile: {raport["profil"]}')),
+          P(L('Podpis cyfrowy raportu: ', 'Digital signature of the report: ') +
+            (L(f'TAK (Ed25519), odcisk klucza {pod["odcisk_klucza"]}', f'YES (Ed25519), key fingerprint {pod["odcisk_klucza"]}')
+             if pod['podpisany'] else L('BRAK — raport niepodpisany', 'NONE — report is unsigned')), stb if pod['podpisany'] else alarm),
+          P(L('Pola wg NIST SP 800-88r2 §4.6. „Metoda wg” — narzędzie nie jest certyfikowane przez stronę trzecią.',
+              'Fields per NIST SP 800-88r2 §4.6. "Method per" — the tool is not certified by a third party.'))]
+    if raport.get('nic_nie_skasowano'):
+        el.append(P(L('NIC NIE SKASOWANO: ', 'NOTHING ERASED: ') + raport['nic_nie_skasowano'], alarm))
+    el += [P(L('Komputer', 'Computer'), h2),
+           tabela([(L('Producent / model', 'Manufacturer / model'), f'{s["producent"]} {s["model"]}'),
+                   (L('Numer seryjny', 'Serial number'), s['numer_seryjny']), ('UUID', s['uuid']),
+                   (L('Nr środka trwałego / zlecenia', 'Asset / job number'), raport.get('numer_srodka')),
+                   (L('Procesor / RAM', 'CPU / RAM'), f'{s["procesor"]} / {czytelny_rozmiar(s["pamiec_b"])}'),
+                   (L('Rozruch / czas', 'Boot / time'), f'{s["rozruch"]}; ' +
+                    (L('czas z NTP', 'time from NTP') if s['czas_z_ntp'] else L('zegar komputera (RTC), bez NTP', 'computer clock (RTC), no NTP')) +
+                    L(f', strefa {s["strefa"]}', f', time zone {s["strefa"]}')),
+                   (L('Narzędzia', 'Tools'), ', '.join(f'{k} {v}' for k, v in s['narzedzia'].items()))]),
+           P(L('Podsumowanie', 'Summary'), h2)]
+    pods = [[P(L('Dysk', 'Disk'), stb), P('Model / S/N', stb), P(L('Metoda', 'Method'), stb), P('Status', stb)]]
+    for d in raport['dyski']:
+        pods.append([P(d['urzadzenie']), P(f'{d["model"]} / {d["numer_seryjny"]}'), P(f'{kod(d["metoda_nist"])}: {d["technika"]}'),
+                     P(kod(d['status']), stb)])
+    for d in raport.get('pominiete', []):
+        pods.append([P(d['urzadzenie']), P(f'{d["model"]} / {d["numer_seryjny"]}'), P(L('POMINIĘTY: ', 'SKIPPED: ') + d['powod']), P('—')])
+    t = Table(pods, colWidths=(20 * mm, 52 * mm, 72 * mm, 36 * mm))
+    t.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 0.3, colors.grey), ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                           ('VALIGN', (0, 0), (-1, -1), 'TOP')]))
+    el.append(t)
+    for d in raport['dyski']:
+        w = d.get('weryfikacja') or {}
+        el += [PageBreak(), P(L('Dysk ', 'Disk ') + f'{d["urzadzenie"]} — {kod(d["status"])}', h2),
+               tabela([(L('Producent / model', 'Manufacturer / model'), f'{d["producent"]} / {d["model"]}'),
+                       (L('Numer seryjny', 'Serial number'), f'{d["numer_seryjny"]} ' + L('(źródło: ', '(source: ') + f'{kod(d["zrodlo_numeru"])})'),
+                       ('Firmware / WWN', f'{d["firmware"]} / {d["wwn"] or "—"}'),
+                       (L('Typ nośnika / interfejs', 'Media type / interface'), f'{kod(d["typ_nosnika"])} / {d["interfejs"]}'),
+                       (L('Źródło nośnika', 'Media source'), L('komputer ', 'computer ') + f'{s["producent"]} {s["model"]}, S/N {s["numer_seryjny"]}'),
+                       (L('Pojemność', 'Capacity'),
+                        L(f'IDENTIFY: {d["rozmiar_identify_b"] or "—"} B; urządzenie: {d["rozmiar_urzadzenia_b"]} B '
+                          f'({czytelny_rozmiar(d["rozmiar_urzadzenia_b"])}); zapisane: {d["zapisane_b"] or "—"} B; '
+                          f'zweryfikowane: {d["zweryfikowane_b"] or "—"} B',
+                          f'IDENTIFY: {d["rozmiar_identify_b"] or "—"} B; device: {d["rozmiar_urzadzenia_b"]} B '
+                          f'({czytelny_rozmiar(d["rozmiar_urzadzenia_b"])}); written: {d["zapisane_b"] or "—"} B; '
+                          f'verified: {d["zweryfikowane_b"] or "—"} B')),
+                       (L('Zawartość przed (sygnatury)', 'Content before (signatures)'), ', '.join(d['zawartosc_przed'] or []) or L('brak', 'none')),
+                       (L('Metoda (NIST)', 'Method (NIST)'), kod(d['metoda_nist'])), (L('Technika wykonana', 'Technique performed'), d['technika']),
+                       (L('Podstawa klasyfikacji', 'Classification basis'), d['klasyfikacja_zrodlo']),
+                       (L('Narzędzie', 'Tool'), f'{raport["program"]}; ' + ', '.join(f'{k} {v}' for k, v in s['narzedzia'].items()
+                                                                                    if k in ('hdparm', 'nvme-cli', 'openseachest'))),
+                       (L('Weryfikacja', 'Verification'), f'{w.get("metoda", "—")}; ' + L('zaliczona: ', 'passed: ') + f'{w.get("zaliczona")}'),
+                       (L('Szczegóły weryfikacji', 'Verification details'),
+                        json.dumps(raport_eksport({k: v for k, v in w.items() if k != 'metoda'}), ensure_ascii=False)),
+                       (L('Start / koniec', 'Start / end'), f'{d["start"]} / {d["koniec"]}'),
+                       (L('SMART przed', 'SMART before'), json.dumps(raport_eksport(d['smart_przed']), ensure_ascii=False)),
+                       (L('SMART po', 'SMART after'), json.dumps(raport_eksport(d['smart_po']), ensure_ascii=False)),
+                       (L('Zastrzeżenia', 'Warnings'), ' · '.join(d['zastrzezenia']) or '—'),
+                       (L('Niepotwierdzone', 'Unconfirmed'), ' · '.join(d['niepotwierdzone']) or '—'),
+                       (L('Uwagi', 'Notes'), ' · '.join(u for u in d['uwagi'] if u) or '—')])]
+    el += [PageBreak(), P(L('Osoba wykonująca i weryfikująca', 'Person performing and verifying'), h2),
+           tabela([(L('Imię i nazwisko', 'Name'), op['name']), (L('Stanowisko', 'Title'), op['title']),
+                   (L('Organizacja', 'Organization'), op['organization']), (L('Miejsce', 'Location'), op['location']),
+                   (L('Kontakt', 'Contact'), op['contact']), (L('Data', 'Date'), raport['utworzono']),
+                   (L('Podpis odręczny', 'Handwritten signature'), '\n\n\n')]),
+           Spacer(1, 6 * mm),
+           P(L('Integralność: MANIFEST.sha256 zawiera sumy SHA-256 wszystkich plików raportu; podpis Ed25519 obejmuje manifest. '
+               'Weryfikacja: `shamanwipe verify <katalog>` albo OpenSSL ≥ 3: openssl pkeyutl -verify -pubin -inkey public-key.pem '
+               '-rawin -in MANIFEST.sha256 -sigfile MANIFEST.sha256.sig (plus sha256sum -c MANIFEST.sha256).',
+               'Integrity: MANIFEST.sha256 holds SHA-256 sums of all report files; the Ed25519 signature covers the manifest. '
+               'Verification: `shamanwipe verify <directory>` or OpenSSL ≥ 3: openssl pkeyutl -verify -pubin -inkey public-key.pem '
+               '-rawin -in MANIFEST.sha256 -sigfile MANIFEST.sha256.sig (plus sha256sum -c MANIFEST.sha256).'))]
+    SimpleDocTemplate(sciezka, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
+                      title=tytul, author=raport['program']).build(el)
+    return True
+
+
+def odcisk_klucza(pub):
+    rc, out, _ = uruchom(['sh', '-c', 'openssl pkey -pubin -in "$1" -outform DER | sha256sum', 'sh', pub], timeout=20)
+    return out.split()[0] if rc == 0 and out else ''
+
+
+def pytaj_haslo(zacheta, limit_s=None, przerwij=None):
+    """Hasło bez echa. limit_s: czas na wpisanie; przerwij(): sprawdzane co sekundę (AUTOMAT: przerwanie z innej konsoli)."""
+    import getpass
+    if limit_s is None:
+        try:
+            return getpass.getpass(zacheta)
+        except (EOFError, KeyboardInterrupt):
+            return ''
+    sys.stdout.write(zacheta + L(f'(limit {limit_s} s) ', f'({limit_s} s limit) '))
+    sys.stdout.flush()
+    stare = None
+    try:
+        stare = termios.tcgetattr(sys.stdin)
+        nowe = termios.tcgetattr(sys.stdin)
+        nowe[3] &= ~termios.ECHO
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, nowe)
+    except (termios.error, ValueError):
+        stare = None
+    try:
+        koniec = time.time() + limit_s
+        while time.time() < koniec:
+            if przerwij and przerwij():
+                return ''
+            r, _, _ = select.select([sys.stdin], [], [], min(1.0, max(0.0, koniec - time.time())))
+            if r:
+                return sys.stdin.readline().strip()
+        return ''
+    finally:
+        if stare:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, stare)
+        print()
+
+
+def klucz_podpisuje(priv):
+    """Próbny podpis przed kasowaniem: raport dostaje „podpisany” tylko z kluczem, który naprawdę podpisuje."""
+    p = os.path.join(KATALOG_RUN, 'test-podpisu')
+    with open(p, 'w') as f:
+        f.write(teraz_iso())
+    rc = uruchom(['openssl', 'pkeyutl', '-sign', '-inkey', priv, '-rawin', '-in', p, '-out', p + '.sig'], timeout=20)[0]
+    for x in (p, p + '.sig'):
+        with contextlib.suppress(OSError):
+            os.remove(x)
+    if rc != 0:
+        print(L('Klucz podpisu nie podpisuje (próba nieudana) — raporty będą NIEPODPISANE.',
+                'The signing key cannot sign (test failed) — reports will be UNSIGNED.'))
+    return rc == 0
+
+
+def przygotuj_klucz(interaktywnie=True, limit_s=None, przerwij=None):
+    """(klucz prywatny w /run, klucz publiczny) albo (None, None). Hasło idzie wyłącznie stdin-em do openssl."""
+    kat = os.path.join(MNT_RAPORTY, 'key')
+    priv, pub = os.path.join(kat, 'shamanwipe-signing.pem'), os.path.join(kat, 'shamanwipe-signing.pub.pem')
+    if not (os.path.exists(priv) and os.path.exists(pub)):
+        return None, None
+    cel = os.path.join(KATALOG_RUN, 'klucz.pem')
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    stara = os.umask(0o077)
+    try:
+        if uruchom(['openssl', 'pkey', '-in', priv, '-passin', 'pass:', '-out', cel], timeout=20)[0] == 0:
+            return (cel, pub) if klucz_podpisuje(cel) else (None, None)
+        if not interaktywnie or not sys.stdin.isatty():
+            return None, None
+        haslo = pytaj_haslo(L('Hasło klucza podpisu raportów (Enter = bez podpisu): ',
+                              'Report signing key passphrase (Enter = no signature): '), limit_s, przerwij)
+        if not haslo:
+            return None, None
+        if uruchom(['openssl', 'pkey', '-in', priv, '-passin', 'stdin', '-out', cel], timeout=20, wejscie=haslo + '\n')[0] == 0:
+            return (cel, pub) if klucz_podpisuje(cel) else (None, None)
+        print(L('Złe hasło — raporty będą NIEPODPISANE.', 'Wrong passphrase — reports will be UNSIGNED.'))
+        return None, None
+    finally:
+        os.umask(stara)
+
+
+def manifest(kat):
+    linie = []
+    for korz, _, pliki in os.walk(kat):
+        for p in pliki:
+            wzgl = os.path.relpath(os.path.join(korz, p), kat)
+            if wzgl in ('MANIFEST.sha256', 'MANIFEST.sha256.sig'):
+                continue
+            with open(os.path.join(korz, p), 'rb') as f:
+                linie.append((wzgl, hashlib.sha256(f.read()).hexdigest()))
+    with open(os.path.join(kat, 'MANIFEST.sha256'), 'w') as f:
+        f.write(''.join(f'{h}  {n}\n' for n, h in sorted(linie)))
+
+
+def zapisz_raport(zadania, operator, numer_srodka, profil, tryb, t_start, klucz, inwentarz_dyski=None, nic=None):
+    system = dane_systemu()
+    baza, na_pendrive = katalog_raportow()
+    rdzen = f'{teraz().strftime("%Y%m%d-%H%M%S")}_{re.sub(r"[^A-Za-z0-9-]", "", system["numer_seryjny"] or system["uuid"] or "computer")[:32]}'
+    ident, n = rdzen, 1
+    os.makedirs(baza, exist_ok=True)
+    while True:  # mkdir atomowy: dwa raporty w tej samej sekundzie dostają różne katalogi
+        try:
+            os.mkdir(os.path.join(baza, ident))
+            break
+        except FileExistsError:
+            n += 1
+            ident = f'{rdzen}-{n}'
+    kat = os.path.join(baza, ident)
+    os.makedirs(os.path.join(kat, 'smart'))
+    dyski = [wiersz_dysku(z) for z in zadania]
+    for z in zadania:
+        for etap in ('przed', 'po'):
+            surowy = z.d.get(f'smart_{etap}_surowy')
+            if surowy:
+                with open(os.path.join(kat, 'smart', f'{z.d["nazwa"]}-{etap}.json'), 'w') as f:
+                    f.write(surowy)
+    wykonane = {x['urzadzenie'] for x in dyski}
+    raport = {'id': ident, 'utworzono': teraz_iso(), 'rozpoczeto': t_start, 'program': f'shamanwipe {WERSJA}', 'jezyk': JEZYK, 'tryb': tryb,
+              'profil': profil, 'opis_profilu': PROFILE.get(profil, ''), 'operator': operator, 'numer_srodka': numer_srodka,
+              'system': system, 'dyski': dyski, 'nic_nie_skasowano': nic,
+              'podsumowanie': {s: sum(1 for d in dyski if d['status'] == s) for s in STATUSY},
+              'pominiete': [{'urzadzenie': d['sciezka'], 'model': d.get('model'), 'numer_seryjny': d.get('serial'),
+                             'powod': '; '.join(d.get('chroniony') or d.get('plan', {}).get('uwagi', [])) or L('nie wybrany', 'not selected')}
+                            for d in (inwentarz_dyski or []) if d['sciezka'] not in wykonane],
+              'podpis': {'podpisany': False, 'odcisk_klucza': '', 'stan': 'NONE'}}
+    if klucz[0]:
+        raport['podpis'] = {'podpisany': True, 'odcisk_klucza': odcisk_klucza(klucz[1]), 'stan': 'Ed25519 over MANIFEST.sha256'}
+    eksport = raport_eksport(raport)
+    with open(os.path.join(kat, 'report.json'), 'w', encoding='utf-8') as f:
+        json.dump(eksport, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(kat, 'report.csv'), 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.writer(f, delimiter=';')
+        w.writerow(['report', 'computer_serial', 'device', 'model', 'serial_number', 'size_bytes', 'media_type', 'nist_method',
+                    'technique', 'verification', 'bytes_verified', 'status', 'warnings', 'start', 'end', 'operator', 'signature'])
+        for d in dyski:
+            w.writerow([ident, system['numer_seryjny'], d['urzadzenie'], d['model'], d['numer_seryjny'], d['rozmiar_urzadzenia_b'],
+                        d['typ_nosnika'], d['metoda_nist'], d['technika'], (d['weryfikacja'] or {}).get('metoda', ''),
+                        d['zweryfikowane_b'], d['status'], ' | '.join(d['zastrzezenia'] + d['niepotwierdzone']), d['start'],
+                        d['koniec'], operator.get('name', ''), raport['podpis']['stan']])
+    korzen = ET.Element('sanitization_report')
+    for k, v in eksport.items():
+        dict_do_xml(korzen, k, v)
+    ET.ElementTree(korzen).write(os.path.join(kat, 'report.xml'), encoding='utf-8', xml_declaration=True)
+    try:
+        pisz_pdf(os.path.join(kat, 'report.pdf'), raport)
+    except Exception as e:  # noqa: BLE001 — brak PDF nie może zgubić JSON/CSV/XML
+        log(f'PDF: error {e}')
+    for plik in ('run.log', 'commands.log'):
+        zr = os.path.join(KATALOG_RUN, plik)
+        if os.path.exists(zr):
+            shutil.copy(zr, os.path.join(kat, plik))
+    if klucz[0]:
+        shutil.copy(klucz[1], os.path.join(kat, 'public-key.pem'))
+    manifest(kat)
+    if klucz[0]:
+        rc, _, err = uruchom(['openssl', 'pkeyutl', '-sign', '-inkey', klucz[0], '-rawin', '-in', os.path.join(kat, 'MANIFEST.sha256'),
+                              '-out', os.path.join(kat, 'MANIFEST.sha256.sig')], timeout=30)
+        if rc != 0:
+            log(f'signature: error {err}')
+    os.sync()
+    return kat, na_pendrive
+
+
+def weryfikuj_raport(kat, pub=None):
+    """0 = sumy i podpis OK (VALID); 1 = sumy OK, raport niepodpisany; 2 = NIEWAŻNY (INVALID)."""
+    mf = os.path.join(kat, 'MANIFEST.sha256')
+    niewazny = L('NIEWAŻNY: ', 'INVALID: ')
+    if not os.path.exists(mf):
+        print(niewazny + L('brak MANIFEST.sha256', 'MANIFEST.sha256 missing'))
+        return 2
+    wpisane, zle = {}, []
+    for linia in open(mf, encoding='utf-8', errors='replace').read().splitlines():
+        if '  ' not in linia:
+            zle.append(L('uszkodzony wiersz manifestu', 'damaged manifest line'))
+            continue
+        h, nazwa = linia.split('  ', 1)
+        wpisane[nazwa] = h
+    for nazwa, h in wpisane.items():
+        sc = os.path.join(kat, nazwa)
+        if not os.path.exists(sc):
+            zle.append(L(f'brak pliku {nazwa}', f'missing file {nazwa}'))
+            continue
+        with open(sc, 'rb') as f:
+            if hashlib.sha256(f.read()).hexdigest() != h:
+                zle.append(L(f'zmieniony plik {nazwa}', f'modified file {nazwa}'))
+    for korz, _, pliki in os.walk(kat):
+        for p in pliki:
+            wzgl = os.path.relpath(os.path.join(korz, p), kat)
+            if wzgl not in wpisane and wzgl not in ('MANIFEST.sha256', 'MANIFEST.sha256.sig'):
+                zle.append(L(f'plik spoza manifestu {wzgl}', f'file not in the manifest {wzgl}'))
+    if zle:
+        print(niewazny + '; '.join(zle))
+        return 2
+    sig = os.path.join(kat, 'MANIFEST.sha256.sig')
+    pub = pub or os.path.join(kat, 'public-key.pem')
+    if not os.path.exists(sig):
+        print(L(f'Sumy SHA-256 zgodne ({len(wpisane)} plików), raport NIEPODPISANY.',
+                f'SHA-256 sums match ({len(wpisane)} files), report is UNSIGNED.'))
+        return 1
+    rc, out, err = uruchom(['openssl', 'pkeyutl', '-verify', '-pubin', '-inkey', pub, '-rawin', '-in', mf, '-sigfile', sig], timeout=30)
+    if rc != 0:
+        print(niewazny + L('podpis nie zgadza się z manifestem albo kluczem', 'the signature does not match the manifest or the key'))
+        return 2
+    print(L(f'WAŻNY: sumy zgodne ({len(wpisane)} plików), podpis Ed25519 poprawny, odcisk klucza {odcisk_klucza(pub)}',
+            f'VALID: sums match ({len(wpisane)} files), Ed25519 signature correct, key fingerprint {odcisk_klucza(pub)}'))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# Nośnik raportów
+# ---------------------------------------------------------------------------------------------
+def zamontuj_raporty():
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    with open(os.path.join(KATALOG_RUN, 'montowanie'), 'a') as f:
+        # dwie konsole startują naraz, a drugi mount vfat w tym samym miejscu nakłada się; limit, gdy mount zawiśnie
+        for _ in range(120):
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(0.5)
+        else:
+            return os.path.ismount(MNT_RAPORTY)
+        if os.path.ismount(MNT_RAPORTY):
+            return True
+        rc, out, _ = uruchom(['blkid', '-L', ETYKIETA_RAPORTOW], timeout=20)
+        if rc != 0 or not out.strip():
+            return False
+        os.makedirs(MNT_RAPORTY, exist_ok=True)
+        uruchom(['mount', '-o', 'rw,noatime,sync', out.strip().splitlines()[0], MNT_RAPORTY], timeout=30)
+        return os.path.ismount(MNT_RAPORTY)
+
+
+def raporty_zapisywalne():
+    """Zapis + fsync + odczyt próbny na SW-REPORTS (warunek startu AUTOMATU)."""
+    if not os.path.ismount(MNT_RAPORTY):
+        return False
+    p = os.path.join(MNT_RAPORTY, '.sw-write-test')
+    tresc = f'{teraz_iso()} {os.getpid()}'
+    try:
+        with open(p, 'w') as f:
+            f.write(tresc)
+            f.flush()
+            os.fsync(f.fileno())
+        ok = open(p).read() == tresc
+        os.remove(p)
+        return ok
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------------------------
+# Interfejs
+# ---------------------------------------------------------------------------------------------
+def tabela_dyskow(dyski, z_planem=True):
+    linie = [f' {L("DYSK", "DISK"):<10}{"TRANSP.":<8}{L("TYP", "TYPE"):<10}{L("ROZMIAR", "SIZE"):>10}  {"MODEL":<26}{"S/N":<22}'
+             + (L('METODA', 'METHOD') if z_planem else '')]
+    for d in dyski:
+        p = d.get('plan') or {}
+        if d.get('chroniony'):
+            metoda = L('CHRONIONY: ', 'PROTECTED: ') + '; '.join(d['chroniony'])
+        elif p and not p.get('mozliwe', True):
+            metoda = L('NIE DA SIĘ: ', 'NOT POSSIBLE: ') + ' '.join(p.get('uwagi', []))
+        else:
+            metoda = f"{kod(p.get('klasa', ''))}: {p.get('technika', '')}" if p else ''
+        linie.append(f' {d["nazwa"]:<10}{d.get("transport") or "-":<8}{kod(d.get("typ_nosnika", "?")):<10}{czytelny_rozmiar(d["rozmiar_b"]):>10}  '
+                     f'{str(d.get("model"))[:25]:<26}{str(d.get("serial"))[:21]:<22}' + (metoda if z_planem else ''))
+    return '\n'.join(linie)
+
+
+def whiptail(*args):
+    p = subprocess.run(['whiptail', '--backtitle', f'ShamanWipe {WERSJA}'] + list(args), stderr=subprocess.PIPE, text=True)
+    return p.returncode, p.stderr.strip()
+
+
+def slowo_potwierdzenia(liczba):
+    return L(f'KASUJ {liczba}', f'ERASE {liczba}')
+
+
+def potwierdzenie_poprawne(tekst, liczba):
+    # Oba języki przyjmowane zawsze: wpisane słowo w drugim języku nie może zablokować świadomej decyzji
+    return tekst.strip().upper() in (f'KASUJ {liczba}', f'ERASE {liczba}')
+
+
+def ekran_koncowy(kat, na_pendrive, zadania, klucz):
+    print('\n' + '=' * 78 + '\n' + L('WYNIK:', 'RESULT:'))
+    for z in zadania:
+        print(f'  {z.d["nazwa"]:<10} {str(z.d.get("model"))[:26]:<27} {kod(z.d["plan"].get("klasa", "")):<6} {kod(z.status)}')
+        for u in z.zastrzezenia + z.niepotwierdzone:
+            print(f'      ! {u}')
+    print(L('\nRaport: ', '\nReport: ') + kat + ('' if na_pendrive else L(
+        '\n  UWAGA: brak partycji SW-REPORTS — raport jest TYLKO w pamięci RAM i zniknie po wyłączeniu!',
+        '\n  WARNING: no SW-REPORTS partition — the report exists ONLY in RAM and will be lost at power-off!')))
+    print(L('Podpis: ', 'Signature: ') + (L('tak', 'yes') if klucz[0] else L('BRAK (brak klucza/hasła)', 'NONE (no key/passphrase)')))
+    print('=' * 78)
+
+
+def tryb_reczny(param):
+    while True:
+        rc, wybor = whiptail('--title', 'ShamanWipe — menu', '--menu', L('Wybierz działanie:', 'Choose an action:'), '17', '74', '7',
+                             '1', L('Kasuj dyski (dobór metody automatyczny)', 'Erase disks (automatic method selection)'),
+                             '2', L('Inwentarz i SMART (niczego nie kasuje)', 'Inventory and SMART (erases nothing)'),
+                             '3', L('Inne standardy nadpisu (nwipe: DoD, Gutmann, RCMP…)', 'Other overwrite standards (nwipe: DoD, Gutmann, RCMP…)'),
+                             '4', L('Weryfikuj podpis raportu', 'Verify a report signature'),
+                             '5', L('Powłoka (root)', 'Shell (root)'), '6', L('Wyłącz komputer', 'Power off'))
+        if rc != 0 or wybor == '5':
+            return
+        if wybor == '6':
+            if wlasciciel_blokady():
+                whiptail('--msgbox', L('Na innej konsoli trwa operacja na dyskach — NIE wyłączam komputera.\nPoczekaj na jej koniec.',
+                                       'A disk operation is running on another console — NOT powering off.\nWait until it finishes.'),
+                         '9', '74')
+                continue
+            subprocess.run(['systemctl', 'poweroff'])
+            return
+        if wybor == '2':
+            z_blokada(lambda: tryb_inwentarz(param, interaktywnie=True))
+        elif wybor == '3':
+            uruchom_nwipe()
+        elif wybor == '4':
+            rc, kat = whiptail('--inputbox', L('Katalog raportu:', 'Report directory:'), '8', '74', os.path.join(MNT_RAPORTY, 'reports'))
+            if rc == 0:
+                weryfikuj_raport(kat)
+                input(L('Enter — powrót', 'Enter — back'))
+        elif wybor == '1':
+            kasowanie_interaktywne()
+
+
+def z_blokada(funkcja):
+    """Operacja na dyskach pod blokadą; zajęta → podgląd przebiegu z innej konsoli (Ctrl+C wraca do menu)."""
+    blokada = zajmij_blokade()
+    if blokada is None:
+        return podglad()
+    try:
+        return funkcja()
+    finally:
+        blokada.close()
+
+
+def kasowanie_interaktywne():
+    # Inwentarz POD blokadą (polecenia do dysków nie mogą trafić w cudze kasowanie); dialogi i hasło BEZ blokady
+    # (operator, który odejdzie od pytania, nie zablokuje drugiej konsoli); kasowanie znowu pod blokadą.
+    blokada = zajmij_blokade()
+    if blokada is None:
+        podglad()
+        return
+    try:
+        print(L('Badam dyski…', 'Scanning disks…'))
+        dyski = inwentarz()
+    finally:
+        blokada.close()
+    if not os.path.ismount(MNT_RAPORTY):
+        whiptail('--msgbox', L('UWAGA: brak partycji SW-REPORTS — raport zostanie tylko w pamięci RAM.\n'
+                               'Włóż pendrive z partycją o etykiecie SW-REPORTS i uruchom program ponownie, jeśli raport ma zostać.',
+                               'WARNING: no SW-REPORTS partition — the report will stay in RAM only.\n'
+                               'Insert a USB drive with a partition labelled SW-REPORTS and restart the program to keep the report.'),
+                 '10', '78')
+    kandydaci = [d for d in dyski if not d.get('chroniony')]
+    if not kandydaci:
+        whiptail('--msgbox', L('Brak dysków do skasowania.\n\n', 'No disks to erase.\n\n') + tabela_dyskow(dyski, False), '20', '110')
+        return
+    rc, profil = whiptail('--title', L('Profil', 'Profile'), '--menu', L('Profil kasowania:', 'Erase profile:'), '12', '100', '3',
+                          *[x for k, v in PROFILE.items() for x in (k, v)])
+    if rc != 0:
+        return
+    plan_dla_wszystkich(dyski, profil)
+    opcje = []
+    for d in kandydaci:
+        p = d['plan']
+        opis = f"{str(d.get('model'))[:20]} {czytelny_rozmiar(d['rozmiar_b'])} S/N {str(d.get('serial'))[:14]} → " + \
+               (f"{kod(p.get('klasa', ''))}: {p.get('technika', '')[:34]}" if p['mozliwe'] else L('NIE DA SIĘ', 'NOT POSSIBLE'))
+        opcje += [d['sciezka'], opis, 'ON' if p['mozliwe'] else 'OFF']
+    chron = [d for d in dyski if d.get('chroniony')]
+    rc, wybrane = whiptail('--title', L('Dyski do skasowania', 'Disks to erase'), '--checklist',
+                           L('Spacja zaznacza. Chronione (nie do wybrania): ', 'Space selects. Protected (cannot be selected): ') +
+                           (', '.join(f"{d['nazwa']} ({'; '.join(d['chroniony'])})" for d in chron) or L('brak', 'none')),
+                           '22', '124', '12', *opcje)
+    wybrane = [w.strip('"') for w in wybrane.split()] if rc == 0 else []
+    if not wybrane:
+        return
+    plan_dla_wszystkich(dyski, profil, wybrane)
+    lista = [d for d in dyski if d['sciezka'] in wybrane and d['plan']['mozliwe']]
+    if not lista:
+        whiptail('--msgbox', L('Żaden z wybranych dysków nie może zostać skasowany:\n\n', 'None of the selected disks can be erased:\n\n') +
+                 tabela_dyskow([d for d in dyski if d['sciezka'] in wybrane]), '20', '110')
+        return
+    operator = czytaj_operatora()
+    for pole, etykieta in (('name', L('Imię i nazwisko operatora', 'Operator name')), ('title', L('Stanowisko', 'Job title')),
+                           ('organization', L('Organizacja', 'Organization')), ('location', L('Miejsce', 'Location')),
+                           ('contact', L('Kontakt (telefon/e-mail)', 'Contact (phone/e-mail)'))):
+        rc, v = whiptail('--inputbox', etykieta, '8', '74', operator[pole])
+        if rc == 0:
+            operator[pole] = v
+    rc, numer = whiptail('--inputbox', L('Numer środka trwałego / zlecenia komputera (może być pusty)',
+                                         'Asset / job number of the computer (may be empty)'), '8', '74', '')
+    szczeg = '\n'.join(f"{d['sciezka']}  {d.get('model')}  S/N {d.get('serial')}  {czytelny_rozmiar(d['rozmiar_b'])}\n    {kod(d['plan']['klasa'])}: {d['plan']['technika']}"
+                       + ''.join(f"\n    ! {u}" for u in d['plan']['uwagi']) for d in lista)
+    rc, potw = whiptail('--title', L('OSTATNIE OSTRZEŻENIE', 'FINAL WARNING'), '--inputbox',
+                        L(f'Dane na tych dyskach zostaną NIEODWRACALNIE zniszczone:\n\n{szczeg}\n\nWpisz:  {slowo_potwierdzenia(len(lista))}',
+                          f'Data on these disks will be IRREVERSIBLY destroyed:\n\n{szczeg}\n\nType:  {slowo_potwierdzenia(len(lista))}'),
+                        '28', '112', '')
+    if rc != 0 or not potwierdzenie_poprawne(potw, len(lista)):
+        whiptail('--msgbox', L('Nie potwierdzono — nic nie zostało skasowane.', 'Not confirmed — nothing was erased.'), '8', '60')
+        return
+    klucz = przygotuj_klucz(interaktywnie=True)
+    blokada = zajmij_blokade()
+    if blokada is None:
+        whiptail('--msgbox', L('Na innej konsoli właśnie ruszyła operacja na dyskach — poczekaj na jej koniec.\nNic nie zostało skasowane.',
+                               'A disk operation has just started on another console — wait until it finishes.\nNothing was erased.'),
+                 '9', '76')
+        return
+    try:
+        zadania, t0 = kasuj(lista, profil)
+        kat, na = zapisz_raport(zadania, operator, numer if rc == 0 else '', profil, 'manual', t0, klucz, dyski)
+        ekran_koncowy(kat, na, zadania, klucz)
+    finally:
+        blokada.close()
+    input(L('\nEnter — powrót do menu', '\nEnter — back to the menu'))
+
+
+def uruchom_nwipe():
+    blokada = zajmij_blokade()
+    if blokada is None:
+        whiptail('--msgbox', L('Na innej konsoli trwa operacja na dyskach — nwipe będzie dostępny po jej końcu.',
+                               'A disk operation is running on another console — nwipe will be available when it finishes.'), '8', '78')
+        return
+    try:
+        dyski = inwentarz(szczegolowo=False)
+        wyklucz = [d['sciezka'] for d in dyski if d.get('chroniony')][:10]
+        baza, _ = katalog_raportow()
+        kat = os.path.join(baza, f'nwipe-{teraz().strftime("%Y%m%d-%H%M%S")}')
+        os.makedirs(kat, exist_ok=True)
+        cmd = ['nwipe', f'--PDFreportpath={kat}', f'--logfile={kat}/nwipe.log'] + (['--exclude=' + ','.join(wyklucz)] if wyklucz else [])
+        subprocess.run(cmd)
+        manifest(kat)
+    finally:
+        blokada.close()
+
+
+class _Inw:
+    """Zadanie-atrapa dla raportu inwentarza / „nic nie skasowano” (bez operacji na dysku)."""
+    def __init__(self, d):
+        self.d, self.status, self.weryfikacja, self.start, self.koniec, self.kroki, self.komunikat = d, 'INVENTORY', None, None, None, [], ''
+        self.zastrzezenia, self.niepotwierdzone, self.zapisane_b = pogorszenie_smart(d.get('smart_przed', {}), {}), [], 0
+        d['smart_po'] = {}
+
+
+def tryb_inwentarz(param, interaktywnie=False):
+    dyski = inwentarz()
+    plan_dla_wszystkich(dyski, 'standard', [d['sciezka'] for d in dyski])
+    print(tabela_dyskow(dyski))
+    kat, na = zapisz_raport([_Inw(d) for d in dyski], czytaj_operatora(), '', 'inventory', 'inventory', teraz_iso(),
+                            przygotuj_klucz(interaktywnie=False))
+    print(L('\nRaport inwentarza: ', '\nInventory report: ') + kat + ('' if na else L(' (tylko RAM — brak SW-REPORTS)', ' (RAM only — no SW-REPORTS)')))
+    if interaktywnie:
+        input(L('Enter — powrót', 'Enter — back'))
+
+
+# ---------------------------------------------------------------------------------------------
+# Konsole, blokada operacji na dyskach, AUTOMAT
+# ---------------------------------------------------------------------------------------------
+def zajmij_blokade():
+    """Blokada operacji na dyskach (kasowanie, inwentarz, nwipe, AUTOMAT): jedna naraz na komputerze, niezależnie od
+    konsoli. Zwalnia ją zamknięcie pliku albo koniec procesu. Otwarty plik albo None (zajęta)."""
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    f = open(PLIK_BLOKADY, 'a')
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def wlasciciel_blokady():
+    """PID procesu trzymającego blokadę albo None — z /proc/locks, BEZ próby flock (próba w złej chwili odebrałaby
+    blokadę konsoli, która właśnie startuje AUTOMAT)."""
+    try:
+        st = os.stat(PLIK_BLOKADY)
+    except OSError:
+        return None
+    for linia in czytaj('/proc/locks').splitlines():
+        p = linia.split()  # '1: FLOCK  ADVISORY  WRITE 1234 00:1a:5678 0 EOF'; '->' = proces czekający
+        if len(p) < 6 or p[1] != 'FLOCK' or '->' in p:
+            continue
+        try:
+            maj, mn, ino = p[5].split(':')
+            if int(ino) == st.st_ino and int(maj, 16) == os.major(st.st_dev) and int(mn, 16) == os.minor(st.st_dev):
+                return int(p[4])
+        except ValueError:
+            continue
+    return None
+
+
+def konsola():
+    k = _env_test('SW_KONSOLA')  # testy: na pseudoterminalu udajemy tty1 / ttyS0
+    if k:
+        return k
+    try:
+        return os.ttyname(sys.stdin.fileno())
+    except OSError:
+        return ''
+
+
+def plik_instancji(k):
+    return os.path.join(KATALOG_RUN, 'instancja-' + os.path.basename(k or 'brak') + '.pid')
+
+
+def zapisz_instancje():
+    k = konsola()
+    if k:
+        tmp = plik_instancji(k) + f'.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            f.write(str(os.getpid()))
+        os.replace(tmp, plik_instancji(k))
+
+
+def instancja_zyje(k):
+    t = czytaj(plik_instancji(k))
+    return t.isdigit() and int(t) != os.getpid() and proces_zyje(t)
+
+
+def wczytaj_json(sciezka):
+    try:
+        with open(sciezka, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+class SurowyTerminal:
+    """Każdy klawisz (także Ctrl+C, Esc, spacja) jako bajt: tryb bez ICANON/ECHO/ISIG; przywracany przy wyjściu."""
+
+    def __enter__(self):
+        self.stare = None
+        try:
+            if sys.stdin.isatty():
+                fd = sys.stdin.fileno()
+                self.stare = termios.tcgetattr(fd)
+                nowe = termios.tcgetattr(fd)
+                nowe[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+                nowe[6][termios.VMIN], nowe[6][termios.VTIME] = 1, 0
+                termios.tcsetattr(fd, termios.TCSANOW, nowe)
+        except (termios.error, ValueError):
+            self.stare = None
+        return self
+
+    def __exit__(self, *_):
+        if self.stare:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.stare)
+
+
+def klawisz(limit):
+    """Czeka do `limit` s na dowolny bajt z konsoli i zjada wszystkie czekające. True = naciśnięto. EOF to nie klawisz."""
+    if not sys.stdin.isatty():
+        time.sleep(limit)
+        return False
+    r, _, _ = select.select([sys.stdin.fileno()], [], [], limit)
+    if not r:
+        return False
+    try:
+        dane = os.read(sys.stdin.fileno(), 4096)
+    except OSError:
+        dane = b''
+    if not dane:
+        time.sleep(limit)
+        return False
+    return True
+
+
+_PRZEBIEG = {}  # id bieżącego przebiegu AUTOMATU (żądanie przerwania z innej konsoli trafia do pliku z tym id)
+FAZY_KONCOWE = ('koniec', 'przerwany', 'odmowa')
+FAZY_BEZ_PRZERWANIA = ('kasowanie',) + FAZY_KONCOWE
+
+
+def plik_przerwania(ident):
+    return os.path.join(KATALOG_RUN, f'przerwij-{ident}')
+
+
+def przerwanie_zgloszone():
+    return bool(_PRZEBIEG.get('id')) and os.path.exists(plik_przerwania(_PRZEBIEG['id']))
+
+
+def faza_automatu(faza, **dane):
+    """Stan AUTOMATU dla podglądu na innej konsoli (zapis atomowy); id + PID pozwalają odróżnić bieżący przebieg."""
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    tmp = PLIK_AUTOMAT + f'.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(dict(dane, faza=faza, czas=time.time(), id=_PRZEBIEG.get('id'), pid=os.getpid(), konsola=konsola()),
+                  f, ensure_ascii=False)
+    os.replace(tmp, PLIK_AUTOMAT)
+
+
+def czekaj_z_przerwaniem(sekundy):
+    """Odliczanie AUTOMATU. Przerywa dowolny klawisz na tej konsoli (także Ctrl+C) albo żądanie z podglądu na innej.
+    True = odliczono do końca bez przerwania."""
+    try:
+        with SurowyTerminal():
+            for i in range(sekundy, 0, -1):
+                if przerwanie_zgloszone():
+                    print()
+                    return False
+                sys.stdout.write(L(f'\r  start za {i:3d} s — DOWOLNY KLAWISZ (na każdej konsoli) przerywa ',
+                                   f'\r  starting in {i:3d} s — ANY KEY (on any console) aborts '))
+                sys.stdout.flush()
+                if klawisz(1):
+                    print()
+                    return False
+    except KeyboardInterrupt:
+        return False
+    print()
+    return not przerwanie_zgloszone()
+
+
+def automat_przerwany(cele):
+    faza_automatu('przerwany', cele=cele)
+    print(L('\nPRZERWANE — nic nie zostało skasowane.', '\nABORTED — nothing was erased.'), flush=True)
+    return 6
+
+
+def tryb_automat(param):
+    profil = ALIASY_PROFILI.get(param.get('auto', 'standard'), param.get('auto', 'standard'))
+    profil = profil if profil in PROFILE else 'standard'
+    _PRZEBIEG.clear()
+    _PRZEBIEG['id'] = f'{int(time.time() * 1000)}-{os.getpid()}'
+    print(L(f'\n*** ShamanWipe {WERSJA} — AUTOMAT, profil: {profil} ***  (dowolny klawisz przerywa)',
+            f'\n*** ShamanWipe {WERSJA} — AUTO, profile: {profil} ***  (any key aborts)'), flush=True)
+    faza_automatu('badanie')
+    cele = []
+    with SurowyTerminal():  # klawisz naciśnięty w trakcie badania = przerwanie (sprawdzane przed pytaniem o hasło)
+        if not raporty_zapisywalne():
+            faza_automatu('odmowa')
+            print(L('ODMOWA: AUTOMAT wymaga zapisywalnej partycji SW-REPORTS (zapis + fsync + odczyt próbny nie powiódł się). Nic nie skasowano.',
+                    'REFUSED: AUTO requires a writable SW-REPORTS partition (test write + fsync + read failed). Nothing was erased.'))
+            return 5
+        print(L('Badam dyski…', 'Scanning disks…'))
+        dyski = inwentarz()
+        if not inwentarz.nosnik_jednoznaczny:
+            faza_automatu('odmowa')
+            print(L('ODMOWA: nie umiem jednoznacznie wskazać nośnika startowego (/run/live/medium ani etykieta SHAMANWIPE). Nic nie skasowano.',
+                    'REFUSED: cannot unambiguously identify the boot medium (neither /run/live/medium nor the SHAMANWIPE label). '
+                    'Nothing was erased.'))
+            return 5
+        plan_dla_wszystkich(dyski, profil, automat=True)
+        print(tabela_dyskow(dyski))
+        lista = [d for d in dyski if d.get('plan', {}).get('mozliwe')]
+        if not lista:
+            powod = L('brak dysków do skasowania', 'no disks to erase')
+            rc, lspci, _ = uruchom(['lspci'], timeout=20)
+            if re.search(r'RAID bus controller|Volume Management Device', lspci):
+                powod += L(' — wykryto kontroler RAID/Intel VMD: dyski mogą być ukryte; w BIOS przełącz SATA na AHCI / wyłącz VMD',
+                           ' — RAID/Intel VMD controller detected: disks may be hidden; in the BIOS switch SATA to AHCI / disable VMD')
+            print(L(f'\n{powod.upper()}. Zapisuję raport „NIC NIE SKASOWANO”.', f'\n{powod.upper()}. Writing a "NOTHING ERASED" report.'))
+            kat, na = zapisz_raport([], czytaj_operatora(), '', profil, 'auto', teraz_iso(), (None, None), dyski, nic=powod)
+            faza_automatu('koniec')
+            print(L('Raport: ', 'Report: ') + f'{kat}\nSHAMANWIPE AUTO DONE NOTHING_ERASED')
+            return 0
+        cele = [f'{d["sciezka"]}  {d.get("model")}  S/N {d.get("serial")}  {czytelny_rozmiar(d["rozmiar_b"])}  → {d["plan"]["klasa"]}: {d["plan"]["technika"]}'
+                for d in lista]
+        nacisniety = klawisz(0)
+    if nacisniety or przerwanie_zgloszone():
+        return automat_przerwany(cele)
+    faza_automatu('hasło', cele=cele)
+    klucz = przygotuj_klucz(interaktywnie=True, limit_s=60, przerwij=przerwanie_zgloszone)
+    print(L(f'\nZa {ODLICZANIE_AUTOMAT_S} s zacznę NIEODWRACALNIE kasować {len(lista)} dysk(ów):',
+            f'\nIn {ODLICZANIE_AUTOMAT_S} s I will IRREVERSIBLY erase {len(lista)} disk(s):'))
+    for c in cele:
+        print(f'   {c}')
+    faza_automatu('odliczanie', cele=cele, koniec=time.time() + ODLICZANIE_AUTOMAT_S)
+    odliczone = czekaj_z_przerwaniem(ODLICZANIE_AUTOMAT_S)
+    if odliczone:
+        faza_automatu('kasowanie', cele=cele)
+        # Ostatnia kontrola PO zapisie fazy: żądanie złożone przed tą linią przerywa; później podgląd widzi „kasowanie”
+        odliczone = not przerwanie_zgloszone()
+    if not odliczone:
+        return automat_przerwany(cele)
+    zadania, t0 = kasuj(lista, profil)
+    kat, na = zapisz_raport(zadania, czytaj_operatora(), '', profil, 'auto', t0, klucz, dyski)
+    wyniki = ' '.join(f'{z.d["nazwa"]}={z.status}' for z in zadania)
+    faza_automatu('koniec', cele=cele, wyniki=wyniki, raport=kat)
+    ekran_koncowy(kat, na, zadania, klucz)
+    print('SHAMANWIPE AUTO DONE ' + wyniki)  # wiersz maszynowy (stały, po angielsku)
+    if param.get('after') == 'poweroff':
+        print(L('Wyłączam komputer za 15 s…', 'Powering off in 15 s…'))
+        time.sleep(15)
+        subprocess.run(['systemctl', 'poweroff'])
+    return 0
+
+
+def podglad(automat=False):
+    """Konsola bez blokady: podgląd przebiegu z innej konsoli.
+    Ręcznie: Ctrl+C albo koniec cudzej operacji wraca. AUTOMAT: KAŻDY klawisz to żądanie przerwania, które trwa, aż trafi
+    do bieżącego przebiegu (id + PID właściciela blokady); werdykt pokazuje WYŁĄCZNIE faza zapisana przez właściciela;
+    wyjście dopiero po końcu AUTOMATU albo zniknięciu jego procesu."""
+    plik_stanu = os.path.join(KATALOG_RUN, 'stan.json')
+    print(L('Operacja na dyskach trwa na innej konsoli. Podgląd przebiegu — ', 'A disk operation is running on another console. '
+            'Progress view — ') + (L('DOWOLNY KLAWISZ PRZERYWA AUTOMAT przed kasowaniem.', 'ANY KEY ABORTS AUTO before erasure.')
+                                   if automat else L('Ctrl+C: powrót.', 'Ctrl+C: back.')), flush=True)
+    chce, dostarczone, komunikat, bez_wlasciciela = False, set(), '', None
+    try:
+        with (SurowyTerminal() if automat else contextlib.nullcontext()):
+            while True:
+                wl = wlasciciel_blokady()
+                a = wczytaj_json(PLIK_AUTOMAT) if automat else None
+                biezacy = bool(a and wl and a.get('pid') == wl)
+                if automat and chce:
+                    if biezacy and a.get('faza') not in FAZY_BEZ_PRZERWANIA and a.get('id') not in dostarczone:
+                        open(plik_przerwania(a['id']), 'w').close()
+                        dostarczone.add(a['id'])
+                    f = a.get('faza') if a else None
+                    if a and a.get('id') in dostarczone:
+                        za_pozno = L('ZA PÓŹNO — kasowanie ruszyło, zanim żądanie dotarło.',
+                                     'TOO LATE — erasure started before the request arrived.')
+                        komunikat = {'przerwany': L('PRZERWANO — potwierdzone przez konsolę AUTOMATU. Nic nie skasowano.',
+                                                    'ABORTED — confirmed by the AUTO console. Nothing was erased.'),
+                                     'kasowanie': za_pozno, 'koniec': za_pozno}.get(
+                            f, L('ŻĄDANIE PRZERWANIA WYSŁANE — czekam na potwierdzenie konsoli AUTOMATU…',
+                                 'ABORT REQUEST SENT — waiting for confirmation from the AUTO console…'))
+                    elif biezacy and f in FAZY_BEZ_PRZERWANIA:
+                        komunikat = L('ZA PÓŹNO — kasowanie już trwa (przerwanie działa tylko przed kasowaniem).',
+                                      'TOO LATE — erasure is already running (abort works only before erasure).')
+                    else:
+                        komunikat = L('ŻĄDANIE PRZERWANIA ZAPAMIĘTANE — trafi do AUTOMATU, zanim zacznie kasować.',
+                                      'ABORT REQUEST STORED — it will reach AUTO before erasure starts.')
+                ekran = (komunikat + '\n\n') if komunikat else ''
+                if a:
+                    f = a.get('faza')
+                    if f == 'odliczanie':
+                        ekran += L(f"AUTOMAT ({a.get('konsola')}): kasowanie za {max(0, int(a.get('koniec', 0) - time.time()))} s\n",
+                                   f"AUTO ({a.get('konsola')}): erasure in {max(0, int(a.get('koniec', 0) - time.time()))} s\n")
+                    else:
+                        ekran += L(f"AUTOMAT ({a.get('konsola')}): faza {kod(f)}\n", f"AUTO ({a.get('konsola')}): phase {kod(f)}\n")
+                    ekran += ''.join(f'   {c}\n' for c in a.get('cele', []))
+                    if a.get('wyniki'):
+                        ekran += L('Wyniki: ', 'Results: ') + f"{a['wyniki']}\n" + L('Raport: ', 'Report: ') + f"{a.get('raport')}\n"
+                stan = wczytaj_json(plik_stanu) if wl else None
+                if stan:
+                    ekran += json.dumps(stan, ensure_ascii=False, indent=1) + '\n'
+                sys.stdout.write('\033[2J\033[H' + (ekran or L('Czekam na stan operacji…\n', 'Waiting for the operation state…\n')))
+                sys.stdout.flush()
+                # wyjście: operacja innej konsoli skończona albo jej proces zniknął
+                if wl is None:
+                    bez_wlasciciela = bez_wlasciciela or time.time()
+                    if not automat:
+                        return 0
+                    if a and (a.get('faza') in FAZY_KONCOWE or not proces_zyje(a.get('pid'))):
+                        if a.get('faza') not in FAZY_KONCOWE:
+                            print(L(f"\nPROCES AUTOMATU (PID {a.get('pid')}) ZNIKNĄŁ w fazie „{kod(a.get('faza'))}”",
+                                    f"\nTHE AUTO PROCESS (PID {a.get('pid')}) DISAPPEARED in phase \"{kod(a.get('faza'))}\"")
+                                  + (L(' — kasowanie mogło zostać przerwane w trakcie; sprawdź dziennik operacji.',
+                                       ' — erasure may have been interrupted midway; check the operations log.') if a.get('faza') == 'kasowanie'
+                                     else L(' — nic nie skasowano.', ' — nothing was erased.')))
+                        return 0
+                    if time.time() - bez_wlasciciela > 15:
+                        print(L('\nAUTOMAT nie wystartował na żadnej konsoli — uruchom go ponownie poleceniem shamanwipe.',
+                                '\nAUTO did not start on any console — run it again with the shamanwipe command.'))
+                        return 0
+                else:
+                    bez_wlasciciela = None
+                if automat:
+                    if klawisz(1):
+                        chce = True
+                elif sys.stdin.isatty():
+                    r, _, _ = select.select([sys.stdin], [], [], 2)
+                    if r and not sys.stdin.readline():
+                        time.sleep(2)
+                else:
+                    time.sleep(2)
+    except KeyboardInterrupt:  # tylko tryb ręczny — w AUTOMACIE Ctrl+C jest zwykłym klawiszem (ISIG wyłączony)
+        return 0
+
+
+def start_automat(param):
+    pref = '/dev/' + param.get('console', 'tty1')
+    if konsola() != pref:
+        # Konsola niepreferowana nie ściga się o AUTOMAT: czeka, aż przejmie go instancja na konsoli preferowanej
+        # (tam trafia pytanie o hasło). Sama przejmuje tylko, gdy tamtej nie ma przez PRZEJECIE_AUTOMATU_S s i AUTOMAT
+        # w tym rozruchu jeszcze nie ruszył (przerwany AUTOMAT nie może ruszyć ponownie na innej konsoli).
+        t0 = time.time()
+        while wlasciciel_blokady() is None and not os.path.exists(PLIK_AUTOMAT):
+            if instancja_zyje(pref):
+                t0 = time.time()
+            elif time.time() - t0 >= PRZEJECIE_AUTOMATU_S:
+                break
+            time.sleep(0.5)
+        if wlasciciel_blokady() is not None or os.path.exists(PLIK_AUTOMAT):
+            return podglad(automat=True)
+        print(L(f'Brak programu na konsoli {pref} — AUTOMAT rusza na tej konsoli ({konsola()}).',
+                f'No program on console {pref} — AUTO starts on this console ({konsola()}).'))
+    blokada = zajmij_blokade()
+    if blokada is None:
+        return podglad(automat=True)
+    try:
+        return tryb_automat(param)
+    finally:
+        blokada.close()
+
+
+def start(args):
+    os.makedirs(KATALOG_RUN, exist_ok=True)
+    param = parametry_jadra()
+    zapisz_instancje()
+    raporty = zamontuj_raporty()
+    rozruch = 'UEFI' if os.path.isdir('/sys/firmware/efi') else 'BIOS'
+    # Baner na KAŻDEJ konsoli, przed jakąkolwiek blokadą; BOOT= to znacznik maszynowy (stały, testy rozruchu)
+    print(f'SHAMANWIPE {WERSJA} ' + L('GOTOWY', 'READY') + f' · BOOT={rozruch} · ' + L('raporty: ', 'reports: ') +
+          (f'{MNT_RAPORTY} (SW-REPORTS)' if raporty else L('BRAK partycji SW-REPORTS — tylko RAM', 'NO SW-REPORTS partition — RAM only')),
+          flush=True)
+    log(f'start, console {konsola()}, parameters: {param}, SW-REPORTS: {raporty}, boot {rozruch}, language {JEZYK}')
+    for w in niedokonczone_operacje():
+        print(L(f'!!! NIEDOKOŃCZONA OPERACJA z {w.get("time")}: ', f'!!! UNFINISHED OPERATION from {w.get("time")}: ')
+              + f'{w.get("device")} S/N {w.get("serial")} — {w.get("technique")}'
+              + (L(f'. Hasło ATA mogło zostać ustawione: hdparm --user-master u --security-disable {ATA_HASLO} <dysk>',
+                   f'. The ATA password may have been set: hdparm --user-master u --security-disable {ATA_HASLO} <disk>')
+                 if w.get('ata_password_set') else ''))
+    try:
+        if 'auto' in param:
+            return start_automat(param)
+        if param.get('mode') == 'inventory':
+            z_blokada(lambda: tryb_inwentarz(param, interaktywnie=sys.stdin.isatty()))
+        elif sys.stdin.isatty():
+            tryb_reczny(param)
+        return 0
+    finally:
+        wl = wlasciciel_blokady()
+        if wl and wl != os.getpid():
+            print(L(f'\nUWAGA: na innej konsoli nadal trwa operacja na dyskach (PID {wl}) — NIE wyłączaj komputera.',
+                    f'\nWARNING: a disk operation is still running on another console (PID {wl}) — do NOT power off.'))
+
+
+def usb_bot(args):
+    """Przełącza mostek USB z UAS na BOT (usb-storage quirks 'u') — dla mostków blokujących ATA w UAS (np. VIA VL711)."""
+    for d in inwentarz(szczegolowo=False):
+        if d.get('transport') != 'usb' or (args.urzadzenie not in (None, d['nazwa'])):
+            continue
+        rc, out, _ = uruchom(['udevadm', 'info', '-q', 'property', '-n', d['sciezka']], timeout=10)
+        p = dict(l.split('=', 1) for l in out.splitlines() if '=' in l)
+        vid, pid = p.get('ID_VENDOR_ID'), p.get('ID_MODEL_ID')
+        if vid and pid:
+            q = f'{vid}:{pid}:u'
+            stare = czytaj('/sys/module/usb_storage/parameters/quirks')
+            with open('/sys/module/usb_storage/parameters/quirks', 'w') as f:
+                f.write(','.join([x for x in stare.split(',') if x] + [q]))
+            print(L(f'{d["nazwa"]}: quirks {q}. ODŁĄCZ i PODŁĄCZ mostek, potem uruchom program jeszcze raz.',
+                    f'{d["nazwa"]}: quirks {q}. UNPLUG and REPLUG the bridge, then run the program again.'))
+    return 0
+
+
+def main():
+    # Polecenia i opcje po angielsku; polskie nazwy działają jako aliasy (lista, kasuj, weryfikuj, --dysk…)
+    profile = list(PROFILE) + list(ALIASY_PROFILI)
+    ap = argparse.ArgumentParser(prog='shamanwipe', description=L('Bezpieczne kasowanie dysków (NIST SP 800-88r2 Clear/Purge)',
+                                                                  'Secure disk erasure (NIST SP 800-88r2 Clear/Purge)'))
+    sub = ap.add_subparsers(dest='polecenie')
+    sub.add_parser('start', help=L('start z konsoli (menu / AUTOMAT wg parametrów jądra sw.*)',
+                                   'start from the console (menu / AUTO according to the sw.* kernel parameters)'))
+    pl = sub.add_parser('list', aliases=['lista'], help=L('inwentarz dysków z proponowaną metodą (tylko odczyt)',
+                                                          'disk inventory with the proposed method (read-only)'))
+    pl.add_argument('--json', action='store_true', help=L('wewnętrzny zrzut inwentarza (format niestały)',
+                                                          'internal inventory dump (format not stable)'))
+    pl.add_argument('--profile', '--profil', dest='profil', default='standard', choices=profile)
+    pk = sub.add_parser('erase', aliases=['kasuj'], help=L('kasowanie bez menu (wymaga --confirm "KASUJ N")',
+                                                           'erase without the menu (requires --confirm "ERASE N")'))
+    pk.add_argument('--disk', '--dysk', dest='dysk', action='append', required=True, metavar='DISK')
+    pk.add_argument('--profile', '--profil', dest='profil', default='standard', choices=profile)
+    pk.add_argument('--confirm', '--potwierdzam', dest='potwierdzam', required=True, metavar='TEXT',
+                    help=L('dokładnie: "KASUJ <liczba dysków>" (albo "ERASE <liczba>")', 'exactly: "ERASE <number of disks>" (or "KASUJ <n>")'))
+    pk.add_argument('--asset-number', '--numer-srodka', dest='numer_srodka', default='', metavar='ASSET_NUMBER')
+    pw = sub.add_parser('verify', aliases=['weryfikuj'], help=L('sprawdza sumy i podpis raportu', 'checks report checksums and signature'))
+    pw.add_argument('katalog', metavar='directory')
+    pw.add_argument('--key', '--klucz', dest='klucz', default=None, metavar='KEY')
+    pu = sub.add_parser('usb-bot', help=L('mostek USB: tryb BOT zamiast UAS (dla poleceń ATA)', 'USB bridge: BOT instead of UAS (for ATA commands)'))
+    pu.add_argument('urzadzenie', nargs='?', metavar='device')
+    a = ap.parse_args()
+    polecenie = {'lista': 'list', 'kasuj': 'erase', 'weryfikuj': 'verify'}.get(a.polecenie, a.polecenie)
+    if getattr(a, 'profil', None):
+        a.profil = ALIASY_PROFILI.get(a.profil, a.profil)
+
+    if polecenie in (None, 'start'):
+        return start(a)
+    if polecenie == 'verify':
+        return weryfikuj_raport(a.katalog, a.klucz)
+    if os.geteuid() != 0:
+        print(L('Wymagane uprawnienia root.', 'Root privileges required.'))
+        return 9
+    if polecenie == 'usb-bot':
+        return usb_bot(a)
+    zamontuj_raporty()
+    blokada = zajmij_blokade()  # list i erase wysyłają polecenia do dysków — nie w trakcie cudzej operacji; zwalnia koniec procesu
+    if blokada is None:
+        print(L('ODMOWA: na innej konsoli trwa operacja na dyskach (kasowanie/inwentarz). Nic nie zrobiono.',
+                'REFUSED: a disk operation (erase/inventory) is running on another console. Nothing was done.'))
+        return 3
+    dyski = inwentarz()
+    if polecenie == 'list':
+        plan_dla_wszystkich(dyski, a.profil, [d['sciezka'] for d in dyski])
+        if a.json:
+            print(json.dumps([{k: v for k, v in d.items() if not k.endswith('_surowy')} for d in dyski], ensure_ascii=False, indent=1))
+        else:
+            print(tabela_dyskow(dyski))
+        return 0
+    if polecenie == 'erase':
+        mapa = {d['sciezka']: d for d in dyski}
+        mapa.update({'/dev/' + d['nazwa']: d for d in dyski})
+        bledy = [L(f'{x}: nie ma takiego dysku', f'{x}: no such disk') for x in a.dysk if x not in mapa]
+        bledy += [f'{x}: ' + L('CHRONIONY — ', 'PROTECTED — ') + '; '.join(mapa[x]['chroniony'])
+                  for x in a.dysk if x in mapa and mapa[x].get('chroniony')]
+        if bledy:
+            print(L('ODMOWA, nic nie skasowano:\n  ', 'REFUSED, nothing was erased:\n  ') + '\n  '.join(bledy))
+            return 3
+        if not potwierdzenie_poprawne(a.potwierdzam, len(a.dysk)):
+            print(L(f'ODMOWA: wymagane --confirm "KASUJ {len(a.dysk)}"', f'REFUSED: --confirm "ERASE {len(a.dysk)}" required'))
+            return 3
+        lista = plan_dla_wszystkich(dyski, a.profil, [mapa[x]['sciezka'] for x in a.dysk])
+        niem = [d for d in lista if not d['plan']['mozliwe']]
+        if niem:
+            print(L('ODMOWA: ', 'REFUSED: ') + '; '.join(f"{d['nazwa']}: {' '.join(d['plan']['uwagi'])}" for d in niem))
+            return 3
+        if _env_test('SW_TEST_PODMIANA'):  # tylko testy podmiany dysku i blokady: pauza między planem a wykonaniem
+            print('SWAP: waiting', flush=True)
+            while not os.path.exists(_env_test('SW_TEST_PODMIANA')):
+                time.sleep(0.2)
+        klucz = przygotuj_klucz(interaktywnie=sys.stdin.isatty())
+        zadania, t0 = kasuj(lista, a.profil)
+        kat, na = zapisz_raport(zadania, czytaj_operatora(), a.numer_srodka, a.profil, 'command', t0, klucz, dyski)
+        ekran_koncowy(kat, na, zadania, klucz)
+        return 0 if all(z.status in ('ERASED', 'ERASED_WITH_WARNINGS') for z in zadania) else 4
+    return 1
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())

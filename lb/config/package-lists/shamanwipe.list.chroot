@@ -1,0 +1,45 @@
+# Erase engines (all from Debian 13)
+openseachest
+hdparm
+nvme-cli
+sg3-utils
+smartmontools
+nwipe
+sedutil
+mmc-utils
+
+# Disks and hardware (NO mdadm/lvm2/cryptsetup — nothing may assemble or unlock the disks to be erased)
+util-linux
+fdisk
+parted
+dosfstools
+exfatprogs
+lsscsi
+pciutils
+usbutils
+dmidecode
+lshw
+
+# Program and report
+python3
+python3-reportlab
+fonts-dejavu-core
+openssl
+whiptail
+jq
+less
+nano
+procps
+psmisc
+kmod
+
+# Console: locales and keyboard layouts (English and Polish)
+locales
+console-setup
+keyboard-configuration
+kbd
+
+# Network time for the report (DHCP + NTP), no SSH server
+systemd-resolved
+systemd-timesyncd
+ca-certificates
