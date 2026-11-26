@@ -56,7 +56,7 @@ image() {
     for p in out/key-*.pub.pem; do
       [ -e "$p" ] || continue
       mv "$p" "keys/${p#out/key-}"
-      echo ">> public key: keys/${p#out/key-} (add it to the repo)"
+      echo ">> public key: keys/${p#out/key-} (your list of trusted keys; keep a copy - keys/ is not in the repository)"
     done
   fi
   ( cd "$out_dir" && shasum -a 256 -c "$(basename "$IMG").sha256" )

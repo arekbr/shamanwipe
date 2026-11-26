@@ -3,14 +3,15 @@
 # ShamanWipe
 
 **Startowy system Debian 13 live do bezpiecznego kasowania dysków** — sprzętowe kasowanie SSD/NVMe tam, gdzie dysk
-je obsługuje, nadpis z weryfikacją tam, gdzie nie, i podpisany raport (PDF, JSON, CSV, XML) z każdego kasowania.
+je obsługuje, nadpis z weryfikacją tam, gdzie nie, i podpisany raport (PDF, JSON, CSV, XML) z każdego kasowania,
+które wykonuje.
 
 Polski · [English](README.md)
 
 > Stan: **0.1.0, wczesne wydanie.** Cały przebieg jest przetestowany w kontenerach i w QEMU (BIOS i UEFI, płyta
-> i USB). Polecenia kasowania w firmware są tak dobre, jak firmware dysku, i nie dla każdej klasy urządzeń zostały
-> już potwierdzone przez ShamanWipe na prawdziwym sprzęcie — do tego czasu każdy raport mówi to wprost
-> („technika niezweryfikowana w ShamanWipe na sprzęcie tej klasy”).
+> i USB). Polecenia kasowania w firmware są tak dobre, jak firmware dysku, i żadna ich klasa nie została jeszcze
+> oznaczona jako sprawdzona przez ShamanWipe na prawdziwym sprzęcie — do tego czasu każdy raport z taką metodą mówi
+> to wprost („technika niezweryfikowana w ShamanWipe na sprzęcie tej klasy”).
 
 ## Co robi
 
@@ -21,14 +22,16 @@ Polski · [English](README.md)
 - **Najpierw przygotowuje dysk.** Ukryte obszary (HPA/DCO) wykrywa i przed kasowaniem przywraca pełną pojemność.
   Gdy przywrócenie się nie uda, wolno użyć wyłącznie metod firmware (nadpis przez hosta ominąłby ukryty obszar);
   gdy i one zawiodą, dysk kończy jako `FAILED`. Dysk ATA w stanie „frozen” odmraża krótkim uśpieniem komputera,
-  gdy planowaną metodą jest Security Erase, a komputer obsługuje uśpienie do RAM.
-- **Sprawdza wynik, zamiast ufać kodowi wyjścia.** Przed kasowaniem sprzętowym zapisuje 512 losowych znaczników po
-  64 KiB rozłożonych po całym dysku; po kasowaniu każdy musi zniknąć, a na dysku nie może zostać sygnatura systemu
-  plików. Po nadpisie czyta cały dysk (każdy bajt = 0x00). Dane, które przetrwały — znacznik na miejscu, niezerowy
-  blok — zawsze dają `FAILED`.
+  gdy planowaną metodą jest Security Erase, a komputer obsługuje uśpienie do RAM. Security Erase rusza dopiero
+  wtedy, gdy świeży IDENTIFY, odczytany tuż przed nim, potwierdzi „not frozen” — także gdy SE jest tylko rezerwą;
+  dysk zamrożony, brak tej flagi albo nieudany odczyt oznaczają, że SE jest pomijany.
+- **Sprawdza wynik, zamiast ufać kodowi wyjścia.** Przed kasowaniem sprzętowym (poza eMMC) zapisuje 512 losowych
+  znaczników po 64 KiB rozłożonych po całym dysku; po kasowaniu każdy musi zniknąć, a na dysku nie może zostać
+  sygnatura systemu plików. Nadpis i procedura eMMC kończą się odczytem całego dysku (każdy bajt = 0x00). Dane,
+  które przetrwały — znacznik na miejscu, niezerowy blok — zawsze dają `FAILED`.
 - **Uczciwie klasyfikuje** wg NIST SP 800-88r2 (wrzesień 2025): `PURGE` tylko dla poleceń sanitize i kasowania
   kryptograficznego, `CLEAR` dla nadpisu, ATA Security Erase i NVMe Format bez kasowania kryptograficznego, `NONE`
-  dla mostka USB bez przepustowości ATA i dla wolumenów RAID sprzętowego. Klasa opisuje technikę; to, czy wynik
+  dla mostka USB, który nie przekazuje ani poleceń ATA, ani SCSI Sanitize, i dla wolumenów RAID sprzętowego. Klasa opisuje technikę; to, czy wynik
   jest potwierdzony, mówi status: `ERASED` (skasowany), `ERASED_WITH_WARNINGS` (skasowany z zastrzeżeniem),
   `UNCONFIRMED` (niepotwierdzony), `FAILED` (niepowodzenie).
 - **Zapisuje podpisany raport** na partycji `SW-REPORTS` pendrive'a: `report.pdf`, `report.json`, `report.csv`,
@@ -37,38 +40,43 @@ Polski · [English](README.md)
   działającego klucza raport mówi na pierwszej stronie, że jest niepodpisany.
 - **Pilnuje przed pomyłką:** nośnik startowy i zamontowane dyski są chronione; kasowanie ręczne wymaga wpisania
   `KASUJ N`; numer seryjny i rozmiar dysku są odczytywane ponownie przed jego krokami niszczącymi, a niezgodność
-  przerywa kasowanie tego dysku; każde polecenie niszczące trafia do dziennika, zanim ruszy, a po następnym starcie
-  widać operacje niedokończone (gdy dziennik leży na `SW-REPORTS`).
+  przerywa kasowanie tego dysku; każde polecenie niszczące trafia do dziennika operacji, zanim ruszy, a po
+  następnym starcie widać operacje niedokończone (gdy dziennik leży na `SW-REPORTS`; jeśli dziennika nie da się
+  zapisać, kasowanie i tak trwa, a błąd odnotowuje tylko `run.log`).
 - **Tryb AUTOMAT** do serii: wybierany z podmenu startowego (nigdy domyślny), pokazuje listę celów i odlicza 60 s;
-  dowolny klawisz na dowolnej konsoli przerywa — do chwili, gdy kasowanie ruszy. Nie wystartuje bez zapisywalnej
+  dowolny klawisz na dowolnej konsoli przerywa odliczanie (inna konsola może przerwać już w trakcie pytania o hasło
+  klucza). Po odliczaniu program nie daje już bezpiecznego sposobu anulowania przebiegu — zabicie procesu nie
+  zatrzyma polecenia firmware wysłanego już do dysku. Nie wystartuje bez zapisywalnej
   partycji `SW-REPORTS` ani wtedy, gdy nie umie jednoznacznie wskazać nośnika startowego; wolumeny RAID sprzętowego
   pomija.
 - **Poza tym:** tryb inwentarza i SMART (niczego nie kasuje), `nwipe` dla innych standardów nadpisu (DoD, Gutmann,
-  RCMP…), `sedutil-cli` do PSID revert dysków samoszyfrujących, rozruch BIOS i UEFI (podpisane przez Debiana shim
+  RCMP…; zapisuje własny raport PDF i dziennik, nie podpisany raport ShamanWipe), `sedutil-cli` do PSID revert dysków samoszyfrujących, rozruch BIOS i UEFI (podpisane przez Debiana shim
   i GRUB), interfejs po angielsku i po polsku.
 
 ## Tabela decyzji
 
 `tests/test_dobor.py` sprawdza kod wobec tej tabeli. Kolejność = preferencja; rezerwa rusza tylko wtedy, gdy
 poprzednia metoda zawiedzie, a każda metoda — pierwsza czy rezerwowa — tylko wtedy, gdy dysk zgłasza jej obsługę.
+Jedyny wyjątek to eMMC: discard i MMC SANITIZE program próbuje bez sprawdzania obsługi; nieudany SANITIZE daje
+zastrzeżenie, a nadpis zerami i tak się wykonuje.
 
 | Przypadek | Pierwsza technika | Rezerwy (gdy obsługiwane) | Klasa |
 |---|---|---|---|
 | NVMe, Sanitize z crypto erase | Sanitize Crypto Erase | Sanitize Block → Sanitize Overwrite → Format SES=2 → Format SES=1 → nadpis hosta | PURGE (CE) |
-| NVMe, Sanitize block erase | Sanitize Block Erase | Format SES=2 → SES=1 → nadpis hosta | PURGE |
+| NVMe, Sanitize block erase | Sanitize Block Erase | Sanitize Overwrite → Format SES=2 → SES=1 → nadpis hosta | PURGE |
 | NVMe bez Sanitize, Format z crypto erase | Format SES=2 | SES=1 → nadpis hosta | PURGE (CE) |
 | NVMe bez Sanitize i bez crypto | Format SES=1 | nadpis hosta | CLEAR |
 | SATA SSD, Sanitize crypto | ATA SANITIZE crypto scramble | block erase → Sanitize overwrite → enhanced SE → normal SE → nadpis hosta | PURGE (CE) |
 | SATA SSD, Sanitize block | ATA SANITIZE block erase | Sanitize overwrite → enhanced SE → normal SE → nadpis hosta | PURGE |
 | SATA SSD, tylko Security Erase | enhanced SE (normal SE, gdy enhanced nieobsługiwane) | normal SE → nadpis hosta | CLEAR |
-| SATA SSD „frozen” | uśpienie, potem jak wyżej | nadal frozen → bez Security Erase; następna metoda z tabeli | CLEAR |
-| SATA HDD z Sanitize | ATA SANITIZE crypto / overwrite (bez block erase na HDD) | enhanced SE → normal SE → nadpis hosta | PURGE |
+| SATA SSD „frozen”, planowany Security Erase | uśpienie, potem jak wyżej | nadal frozen → zero Security Erase (także w rezerwach): nadpis hosta | CLEAR |
+| SATA HDD z Sanitize | ATA SANITIZE crypto / overwrite (bez block erase na HDD) | Sanitize overwrite (po crypto) → enhanced SE → normal SE → nadpis hosta | PURGE |
 | SATA HDD, tylko Security Erase | enhanced (albo normal) SE | normal SE → nadpis hosta | CLEAR |
 | HDD bez Security Erase | nadpis zerami + pełny odczyt | — | CLEAR |
-| SAS/SCSI z Sanitize | SCSI SANITIZE crypto / block (nie na HDD) / overwrite | nadpis hosta | PURGE |
+| SAS/SCSI z Sanitize | SCSI SANITIZE crypto / block (nie na HDD) / overwrite | pozostałe obsługiwane odmiany SCSI SANITIZE → nadpis hosta | PURGE |
 | Mostek USB z SAT | jak SATA | | |
-| Mostek USB bez SAT | SCSI SANITIZE, gdy mostek go zgłasza, inaczej nadpis hosta | — | NONE → `UNCONFIRMED` (nadpis) |
-| eMMC | discard + MMC SANITIZE + nadpis zerami | — | CLEAR |
+| Mostek USB bez SAT | SCSI SANITIZE, gdy mostek go zgłasza (wtedy jak SAS/SCSI), inaczej nadpis hosta | — | jak SAS/SCSI; bez zgłoszonego ATA ani SCSI Sanitize: NONE → `UNCONFIRMED` |
+| eMMC | discard + MMC SANITIZE (bez sprawdzania obsługi) + nadpis zerami + pełny odczyt | — | CLEAR |
 | Wolumen RAID sprzętowego | ręcznie: nadpis wolumenu; AUTOMAT: pomija | — | NONE → `UNCONFIRMED` |
 | Dysk zablokowany hasłem ATA | — | — | odmowa, nigdy nie nadpisywany |
 | Nie udało się przywrócić HPA/DCO | tylko metody firmware | bez nadpisu hosta | jak metoda; `FAILED`, gdy żadna nie zadziała |
@@ -136,7 +144,7 @@ Z powłoki root:
 shamanwipe lista                                          # dyski i metoda, która zostałaby użyta (tylko odczyt)
 shamanwipe kasuj --dysk /dev/sdb --potwierdzam "KASUJ 1"  # kasowanie bez menu
 shamanwipe weryfikuj /mnt/sw-reports/reports/<raport>     # sumy i podpis raportu
-shamanwipe usb-bot                                        # mostek UAS na BOT, żeby przechodziły polecenia ATA
+shamanwipe usb-bot                                        # mostki UAS w tryb BOT; potem odłącz i podłącz je ponownie
 ```
 
 Działają też polecenia angielskie (`list`, `erase --disk … --confirm "ERASE 1"`, `verify`); `SW_LANG=pl`

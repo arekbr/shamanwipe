@@ -4,13 +4,13 @@
 
 **Bootable Debian 13 live system for secure disk erasure** — hardware sanitize commands for SSD/NVMe where the
 drive supports them, verified overwrite where it does not, and a signed report (PDF, JSON, CSV, XML) for every
-erasure.
+erasure it performs.
 
 [Polski](README.pl.md) · English
 
 > Status: **0.1.0, early release.** The whole flow is tested in containers and in QEMU (BIOS and UEFI, CD and USB).
-> Firmware erase commands are only as good as the drive firmware, and they have not yet been confirmed by
-> ShamanWipe on real hardware for every device class — until they are, each report says so explicitly
+> Firmware erase commands are only as good as the drive firmware, and no class of them has been marked as verified
+> by ShamanWipe on real hardware yet — until it is, every report that uses such a method says so explicitly
 > ("technique not yet verified in ShamanWipe on hardware of this class").
 
 ## What it does
@@ -22,14 +22,16 @@ erasure.
 - **Prepares the drive first.** Hidden areas (HPA/DCO) are detected and the full capacity is restored before
   erasure. If restoring fails, only firmware methods may run (a host overwrite would miss the hidden area); if they
   fail too, the disk ends as `FAILED`. A "frozen" ATA drive is suspended briefly to unfreeze it when Security Erase
-  is the planned method and the computer supports suspend-to-RAM.
-- **Checks the result instead of trusting the exit code.** Before a firmware erase it writes 512 random 64 KiB
-  markers spread across the disk; every one of them must be gone afterwards, and the disk must carry no filesystem
-  signatures. An overwrite is followed by a full read-back (every byte must be 0x00). Data that survived — a
-  marker still in place, a non-zero block — always makes the result `FAILED`.
+  is the planned method and the computer supports suspend-to-RAM. Security Erase starts only after a fresh
+  IDENTIFY, read right before it, confirms "not frozen" — also when it is only a fallback; a frozen drive, a
+  missing flag or a failed read means it is skipped.
+- **Checks the result instead of trusting the exit code.** Before a firmware erase (except on eMMC) it writes 512
+  random 64 KiB markers spread across the disk; every one of them must be gone afterwards, and the disk must carry
+  no filesystem signatures. An overwrite and the eMMC procedure end with a full read-back (every byte must be
+  0x00). Data that survived — a marker still in place, a non-zero block — always makes the result `FAILED`.
 - **Classifies honestly** per NIST SP 800-88r2 (September 2025): `PURGE` only for dedicated sanitize commands and
   cryptographic erase, `CLEAR` for overwrite, ATA Security Erase and NVMe Format without crypto erase, `NONE` for a
-  USB bridge without ATA passthrough and for hardware RAID volumes. The class describes the technique; whether the
+  USB bridge that passes neither ATA nor SCSI Sanitize commands and for hardware RAID volumes. The class describes the technique; whether the
   result is confirmed is told by the status: `ERASED`, `ERASED_WITH_WARNINGS`, `UNCONFIRMED`, `FAILED`.
 - **Writes a signed report** to the `SW-REPORTS` partition of the USB stick: `report.pdf`, `report.json`,
   `report.csv`, `report.xml`, SMART before/after, the full command log, `MANIFEST.sha256` and an Ed25519 signature
@@ -37,37 +39,42 @@ erasure.
   before erasure, and without a working key the report says "unsigned" on its first page.
 - **Guards against accidents:** the boot medium and mounted disks are protected; manual erase requires typing
   `ERASE N`; the serial number and size of a disk are re-read before its destructive steps and a mismatch aborts
-  the erasure of that disk; every destructive command is logged before it starts, and unfinished operations are
-  shown after the next boot (when the log is on `SW-REPORTS`).
+  the erasure of that disk; every destructive command is written to the operations log before it starts, and
+  unfinished operations are shown after the next boot (when the log is on `SW-REPORTS`; if the log cannot be
+  written, the erasure still goes on and the error is recorded only in `run.log`).
 - **AUTO mode** for batches: chosen from a boot submenu (never the default), lists the targets, counts down 60 s;
-  any key on any console aborts — until erasure has started. It refuses to start without a writable `SW-REPORTS`
+  any key on any console aborts the countdown (another console can abort already while the key passphrase is being
+  asked). After the countdown the program offers no safe way to cancel the run — killing the process does not stop
+  a firmware command already sent to a drive. It refuses to start without a writable `SW-REPORTS`
   partition or when the boot medium cannot be identified unambiguously, and it skips hardware RAID volumes.
 - **Also included:** inventory and SMART mode (erases nothing), `nwipe` for other overwrite standards (DoD, Gutmann,
-  RCMP…), `sedutil-cli` for PSID revert of self-encrypting drives, BIOS and UEFI boot (Debian's signed shim and
+  RCMP…; it writes its own PDF report and log, not the signed ShamanWipe report), `sedutil-cli` for PSID revert of self-encrypting drives, BIOS and UEFI boot (Debian's signed shim and
   GRUB), English and Polish user interface.
 
 ## Decision table
 
 `tests/test_dobor.py` checks the code against this table. Order = preference; a fallback is used only when the
-previous method fails, and every method — first or fallback — only when the drive reports support for it.
+previous method fails, and every method — first or fallback — only when the drive reports support for it. The one
+exception is eMMC: discard and MMC SANITIZE are attempted without a support check; a failed SANITIZE adds a warning
+and the zero overwrite still runs.
 
 | Case | First technique | Fallbacks (if supported) | Class |
 |---|---|---|---|
 | NVMe, Sanitize with crypto erase | Sanitize Crypto Erase | Sanitize Block → Sanitize Overwrite → Format SES=2 → Format SES=1 → host overwrite | PURGE (CE) |
-| NVMe, Sanitize block erase | Sanitize Block Erase | Format SES=2 → SES=1 → host overwrite | PURGE |
+| NVMe, Sanitize block erase | Sanitize Block Erase | Sanitize Overwrite → Format SES=2 → SES=1 → host overwrite | PURGE |
 | NVMe without Sanitize, Format with crypto erase | Format SES=2 | SES=1 → host overwrite | PURGE (CE) |
 | NVMe without Sanitize and crypto | Format SES=1 | host overwrite | CLEAR |
 | SATA SSD, Sanitize crypto | ATA SANITIZE crypto scramble | block erase → Sanitize overwrite → enhanced SE → normal SE → host overwrite | PURGE (CE) |
 | SATA SSD, Sanitize block | ATA SANITIZE block erase | Sanitize overwrite → enhanced SE → normal SE → host overwrite | PURGE |
 | SATA SSD, Security Erase only | enhanced SE (normal SE if enhanced is not supported) | normal SE → host overwrite | CLEAR |
-| SATA SSD "frozen" | suspend, then as above | still frozen → no Security Erase; next method from the table | CLEAR |
-| SATA HDD with Sanitize | ATA SANITIZE crypto / overwrite (no block erase on HDD) | enhanced SE → normal SE → host overwrite | PURGE |
+| SATA SSD "frozen", Security Erase planned | suspend, then as above | still frozen → no Security Erase at all (fallbacks included): host overwrite | CLEAR |
+| SATA HDD with Sanitize | ATA SANITIZE crypto / overwrite (no block erase on HDD) | Sanitize overwrite (after crypto) → enhanced SE → normal SE → host overwrite | PURGE |
 | SATA HDD, Security Erase only | enhanced (or normal) SE | normal SE → host overwrite | CLEAR |
 | HDD without Security Erase | zero overwrite + full read-back | — | CLEAR |
-| SAS/SCSI with Sanitize | SCSI SANITIZE crypto / block (not on HDD) / overwrite | host overwrite | PURGE |
+| SAS/SCSI with Sanitize | SCSI SANITIZE crypto / block (not on HDD) / overwrite | the other supported SCSI SANITIZE variants → host overwrite | PURGE |
 | USB bridge with SAT | as SATA | | |
-| USB bridge without SAT | SCSI SANITIZE if the bridge reports it, otherwise host overwrite | — | NONE → `UNCONFIRMED` (overwrite) |
-| eMMC | discard + MMC SANITIZE + zero overwrite | — | CLEAR |
+| USB bridge without SAT | SCSI SANITIZE if the bridge reports it (then as SAS/SCSI), otherwise host overwrite | — | as SAS/SCSI; neither ATA nor SCSI Sanitize reported: NONE → `UNCONFIRMED` |
+| eMMC | discard + MMC SANITIZE (no support check) + zero overwrite + full read-back | — | CLEAR |
 | Hardware RAID volume | manual: volume overwrite; AUTO: skipped | — | NONE → `UNCONFIRMED` |
 | Drive locked with an ATA password | — | — | refused, never overwritten |
 | HPA/DCO could not be restored | firmware methods only | no host overwrite | as the method; `FAILED` if none works |
@@ -135,7 +142,7 @@ From the root shell:
 shamanwipe list                                         # disks and the method that would be used (read-only)
 shamanwipe erase --disk /dev/sdb --confirm "ERASE 1"    # erase without the menu
 shamanwipe verify /mnt/sw-reports/reports/<report>      # check checksums and signature
-shamanwipe usb-bot                                      # switch a UAS bridge to BOT so ATA commands pass
+shamanwipe usb-bot                                      # set UAS bridges to BOT mode; then unplug and replug them
 ```
 
 Polish command aliases (`lista`, `kasuj`, `weryfikuj`) and `KASUJ N` are accepted as well. `SW_LANG=pl` switches
