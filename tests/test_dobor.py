@@ -285,6 +285,81 @@ class Przebieg(unittest.TestCase):
         self.assertEqual(z.status, 'UNCONFIRMED')
 
 
+class Odmrazanie(unittest.TestCase):
+    """Dysk nadal zamrożony po uśpieniu: Security Erase znika z kroków ORAZ z rezerw (tabela: nadal frozen → nadpis)."""
+
+    def setUp(self):
+        self.stare = {n: getattr(sw, n) for n in ('uruchom', 'log', 'czytaj', 'odczytaj_tozsamosc', 'zgodna_tozsamosc')}
+        sw.uruchom = lambda *a, **k: (1, '', '')  # hdparm -I po uśpieniu bez nowych danych → stan z IDENTIFY sprzed uśpienia
+        sw.log = lambda *a, **k: None
+        sw.czytaj = lambda *a, **k: ''  # brak S3: bez uśpienia
+        sw.odczytaj_tozsamosc = lambda d: {}
+        sw.zgodna_tozsamosc = lambda a, b: True
+
+    def tearDown(self):
+        for n, f in self.stare.items():
+            setattr(sw, n, f)
+
+    def test_nadal_zamrozony_bez_security_erase_w_krokach_i_rezerwach(self):
+        d = dysk_ata('syntetyczny-hdparm-ssd-frozen.txt', tozsamosc={})
+        d['plan'] = sw.wybierz_metode(d, 'standard')
+        self.assertTrue(d['ata']['bezpieczenstwo'].get('zamrozone'))
+        przed = d['plan']['kroki'] + d['plan']['zapasowe']
+        self.assertTrue(any(k.startswith('ata-se') for k in przed), przed)  # kontrola: plan przed uśpieniem ma SE
+        sw.odmroz_dyski([Z(d)])
+        po = d['plan']['kroki'] + d['plan']['zapasowe']
+        self.assertEqual([k for k in po if k.startswith('ata-se')], [], po)
+        self.assertIn('overwrite-zeros', d['plan']['kroki'])
+
+    def test_po_uspieniu_brak_flagi_frozen_zdejmuje_se_z_planu(self):  # nieznany stan = nadal zamrożony
+        bez_flagi = '\n'.join(w for w in fx('syntetyczny-hdparm-ssd-frozen.txt').splitlines() if 'frozen' not in w)
+        sw.uruchom = lambda cmd, **k: (0, bez_flagi, '') if cmd[:2] == ['hdparm', '-I'] else (1, '', '')
+        d = dysk_ata('syntetyczny-hdparm-ssd-frozen.txt', tozsamosc={})
+        d['plan'] = sw.wybierz_metode(d, 'standard')
+        sw.odmroz_dyski([Z(d)])
+        self.assertEqual([k for k in d['plan']['kroki'] + d['plan']['zapasowe'] if k.startswith('ata-se')], [])
+
+    def _se(self, plik, ident=None, rc_ident=0):
+        """ata_security_erase na atrapach; inwentarz z pliku, świeży hdparm -I = `ident` (domyślnie ten sam plik).
+        Zwraca (wynik, wywołane polecenia)."""
+        polecenia = []
+        tekst = fx(plik) if ident is None else ident
+
+        def uruchom(cmd, **k):
+            polecenia.append(cmd)
+            return (rc_ident, tekst, '') if cmd[:2] == ['hdparm', '-I'] else (0, '', '')
+        sw.uruchom = uruchom
+        d = dysk_ata(plik, tozsamosc={})
+        z = sw.Zadanie(d, 'standard')
+        z._niszczace = lambda *a, **k: None
+        z._koniec_operacji = lambda *a: None
+        try:
+            wynik = z.ata_security_erase(enhanced=True)
+        except Exception as e:  # dalsza część SE na atrapach może się wyłożyć — liczy się, czy padło polecenie hasła
+            wynik = e
+        return wynik, polecenia
+
+    def test_se_jako_rezerwa_na_zamrozonym_dysku_nie_rusza(self):  # SE bywa rezerwą po Sanitize / w profilu nadpisu
+        wynik, polecenia = self._se('syntetyczny-hdparm-ssd-frozen.txt')
+        self.assertFalse([c for c in polecenia if '--security-set-pass' in c], polecenia)
+        self.assertIs(wynik, False)
+
+    def test_se_gdy_swiezy_identify_bez_flagi_frozen_nie_rusza(self):  # nieznany stan ≠ „not frozen”
+        bez_flagi = '\n'.join(w for w in fx('syntetyczny-hdparm-ssd-frozen.txt').splitlines() if 'frozen' not in w)
+        wynik, polecenia = self._se('syntetyczny-hdparm-ssd-frozen.txt', ident=bez_flagi)
+        self.assertFalse([c for c in polecenia if '--security-set-pass' in c], polecenia)
+        self.assertIs(wynik, False)
+
+    def test_se_gdy_odczyt_identify_zawodzi_nie_rusza(self):  # nawet przy dysku „not frozen” w inwentarzu
+        wynik, polecenia = self._se('hdparm-samsung-pm871-0.txt', rc_ident=1)
+        self.assertFalse([c for c in polecenia if '--security-set-pass' in c], polecenia)
+        self.assertIs(wynik, False)
+
+    def test_se_na_odmrozonym_dysku_rusza(self):  # kontrola: ta sama ścieżka bez frozen ustawia hasło
+        wynik, polecenia = self._se('hdparm-samsung-pm871-0.txt')
+        self.assertTrue([c for c in polecenia if '--security-set-pass' in c], polecenia)
+
+
 class Weryfikacja(unittest.TestCase):
     P = [{'pozycja': 0, 'sha256': 'a', 'jednolita': False}, {'pozycja': 4096, 'sha256': 'b', 'jednolita': False}]
 

@@ -44,6 +44,15 @@ MUTACJE = [
     ('przetrwałe dane przy stanie niepotwierdzonym dają UNCONFIRMED zamiast FAILED',
      "            if przetrwaly:  # dowód",
      "            if False:  # dowód"),
+    ('Security Erase uruchamiany na zamrożonym dysku (bramka przed hasłem ATA)',
+     "        if ((a0 or {}).get('bezpieczenstwo') or {}).get('zamrozone') is not False:",
+     "        if False:"),
+    ('nieznany stan frozen po uśpieniu traktowany jak odmrożony',
+     "        if zamr is not False:  # nieznany stan po uśpieniu traktowany jak „nadal zamrożony”",
+     "        if zamr:"),
+    ('dysk nadal zamrożony: Security Erase zostaje w rezerwach',
+     "            z.d['plan']['zapasowe'] = nowe  # SE na zamrożonym dysku nie wraca też jako rezerwa",
+     "            pass"),
 ]
 
 

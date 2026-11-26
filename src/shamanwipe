@@ -1224,6 +1224,13 @@ class Zadanie:
             while not stop.wait(5):
                 self.postep = min(99.0, round((time.time() - t0) / (szac * 60) * 100, 1))
                 self.komunikat = L(f'szacowany czas wg dysku: {szac} min', f'estimated time reported by the drive: {szac} min')
+        # Security Erase tylko po świeżym, jednoznacznym „not frozen” — także gdy SE jest rezerwą (odmrażanie planuje
+        # się wyłącznie dla SE jako metody głównej). Zamrożony, brak flagi albo nieudany odczyt = SE nie rusza.
+        rc0, ident, _ = uruchom(['hdparm', '-I', sc], timeout=30)
+        a0 = parsuj_hdparm_I(ident) if rc0 == 0 else None
+        if ((a0 or {}).get('bezpieczenstwo') or {}).get('zamrozone') is not False:
+            return self._krok('ata-security-erase', 1, L('dysk zamrożony albo stan nieczytelny — Security Erase nie uruchomiony',
+                                                         'drive frozen or its state unreadable — Security Erase not started'))
         self._niszczace('ATA SECURITY ERASE ' + ('enhanced' if enhanced else 'normal'), haslo_ata=True)
         rc, out, err = uruchom(['hdparm', '--user-master', 'u', '--security-set-pass', ATA_HASLO, sc], timeout=60)
         if rc != 0:
@@ -1531,9 +1538,10 @@ def odmroz_dyski(zadania):
             z.d['ata']['bezpieczenstwo'] = a['bezpieczenstwo']
         zamr = z.d['ata']['bezpieczenstwo'].get('zamrozone')
         z.d['plan']['odmrozenie_wynik'] = L('odmrożony', 'unfrozen') if zamr is False else L('nadal zamrożony', 'still frozen')
-        if zamr:
+        if zamr is not False:  # nieznany stan po uśpieniu traktowany jak „nadal zamrożony”
             stare = list(z.d['plan']['kroki'])
             nowe = [k for k in z.d['plan']['zapasowe'] if not k.startswith('ata-se')]
+            z.d['plan']['zapasowe'] = nowe  # SE na zamrożonym dysku nie wraca też jako rezerwa
             z.d['plan']['kroki'] = [k for k in stare if not k.startswith('ata-se')] + (nowe[:1] if not any(not k.startswith('ata-se') and METODY[k][3] != 'host' for k in stare) else [])
             if not z.d['plan']['kroki']:
                 z.d['plan']['kroki'] = ['overwrite-zeros']
