@@ -376,6 +376,53 @@ class Weryfikacja(unittest.TestCase):
         self.assertFalse(sw.ocen_probki(self.P, po)['zaliczona'])
 
 
+class SprawdzoneNaSprzecie(unittest.TestCase):
+    """Lista technik sprawdzonych na prawdziwym sprzęcie działa per technika, nie per rodzina."""
+
+    def plan(self, d, profil='standard'):
+        return sw.wybierz_metode(d, profil)
+
+    def test_sanitize_block_sprawdzony_bez_adnotacji(self):
+        p = self.plan(dysk_ata('hdparm-crucial-bx500-0.txt'))
+        self.assertEqual(p['kroki'], ['ata-sanitize-block'])
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], [])
+
+    def test_se_z_tej_samej_rodziny_nadal_niesprawdzony(self):
+        p = self.plan(dysk_ata('hdparm-samsung-pm871-0.txt'))
+        self.assertEqual(p['kroki'], ['ata-se-enhanced'])
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], ['ata-se-enhanced'])
+
+    def test_sanitize_crypto_niesprawdzony(self):
+        p = self.plan(dysk_ata('syntetyczny-hdparm-ssd-crypto.txt'))
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], ['ata-sanitize-crypto'])
+
+    def test_nvme_niesprawdzony(self):
+        p = self.plan(dysk_nvme(sanicap=7, fna=4))
+        self.assertEqual(p['kroki'], ['nvme-sanitize-crypto'])
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], ['nvme-sanitize-crypto'])
+
+    def test_rezerwa_se_po_sanitize_block_dostaje_adnotacje(self):
+        d = dysk_ata('hdparm-crucial-bx500-0.txt')
+        p = self.plan(d)
+        p['kroki'][0] = 'ata-se-enhanced'  # tak przebieg zapisuje udaną rezerwę, potem przelicza plan
+        sw.uzupelnij_plan(p, d)
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], ['ata-se-enhanced'])
+
+    def test_nadpis_hosta_bez_adnotacji(self):
+        p = self.plan(dysk_ata('syntetyczny-hdparm-hdd-bez-security.txt'))
+        self.assertEqual(p['kroki'], ['overwrite-zeros'])
+        self.assertEqual(p['niezweryfikowane_na_sprzecie'], [])
+
+    def test_raport_wymienia_technike(self):
+        d = dysk_ata('hdparm-samsung-pm871-0.txt')
+        d['plan'] = self.plan(d)
+        z = Z(d)
+        z.komunikat = z.weryfikacja = z.zapisane_b = z.status = z.start = z.koniec = None
+        z.kroki = []
+        uwagi = sw.wiersz_dysku(z)['uwagi']
+        self.assertTrue([u for u in uwagi if u.endswith('(ata-se-enhanced)')], uwagi)
+
+
 class Drobne(unittest.TestCase):
     def test_potwierdzenie(self):
         self.assertTrue(sw.potwierdzenie_poprawne('kasuj 2', 2))

@@ -9,9 +9,11 @@ erasure it performs.
 [Polski](README.pl.md) · English
 
 > Status: **0.1.0, early release.** The whole flow is tested in containers and in QEMU (BIOS and UEFI, CD and USB).
-> Firmware erase commands are only as good as the drive firmware, and no class of them has been marked as verified
-> by ShamanWipe on real hardware yet — until it is, every report that uses such a method says so explicitly
-> ("technique not yet verified in ShamanWipe on hardware of this class").
+> Firmware erase commands are only as good as the drive firmware. On real hardware one technique has been verified
+> so far: ATA SANITIZE BLOCK ERASE, on a Samsung PM871b SATA SSD behind a USB–SATA bridge (the drive reported the
+> sanitize operation as completed without error, and none of the 512 markers survived). When the technique listed
+> in a report is any other firmware technique, the PDF, JSON and XML report says so explicitly ("Technique not yet
+> verified in ShamanWipe on real hardware (…)").
 
 ## What it does
 

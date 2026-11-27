@@ -9,9 +9,11 @@ które wykonuje.
 Polski · [English](README.md)
 
 > Stan: **0.1.0, wczesne wydanie.** Cały przebieg jest przetestowany w kontenerach i w QEMU (BIOS i UEFI, płyta
-> i USB). Polecenia kasowania w firmware są tak dobre, jak firmware dysku, i żadna ich klasa nie została jeszcze
-> oznaczona jako sprawdzona przez ShamanWipe na prawdziwym sprzęcie — do tego czasu każdy raport z taką metodą mówi
-> to wprost („technika niezweryfikowana w ShamanWipe na sprzęcie tej klasy”).
+> i USB). Polecenia kasowania w firmware są tak dobre, jak firmware dysku. Na prawdziwym sprzęcie sprawdzona została
+> dotąd jedna technika: ATA SANITIZE BLOCK ERASE na dysku SSD SATA Samsung PM871b za mostkiem USB–SATA (dysk zgłosił
+> zakończenie operacji bez błędu, a żaden z 512 znaczników nie przetrwał). Gdy technika podana w raporcie to dowolna
+> inna technika firmware, w raportach PDF, JSON i XML pojawia się adnotacja („Technika niezweryfikowana w ShamanWipe
+> na prawdziwym sprzęcie (…)”).
 
 ## Co robi
 

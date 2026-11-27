@@ -53,6 +53,9 @@ MUTACJE = [
     ('dysk nadal zamrożony: Security Erase zostaje w rezerwach',
      "            z.d['plan']['zapasowe'] = nowe  # SE na zamrożonym dysku nie wraca też jako rezerwa",
      "            pass"),
+    ('sprawdzenie na sprzęcie per rodzina: cała rodzina ata uznana za sprawdzoną (SE bez adnotacji)',
+     "if METODY[k][3] != 'host' and k not in ZWERYFIKOWANE_NA_SPRZECIE})",
+     "if METODY[k][3] not in ('host', 'ata')})"),
 ]
 
 

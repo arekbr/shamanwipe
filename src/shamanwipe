@@ -97,8 +97,10 @@ LICZBA_PROBEK = 512
 ODLICZANIE_AUTOMAT_S = int(_env_test('SW_ODLICZANIE', '60'))
 # Konsola niepreferowana przejmuje AUTOMAT dopiero, gdy instancji na konsoli preferowanej nie ma przez tyle sekund
 PRZEJECIE_AUTOMATU_S = int(_env_test('SW_TEST_PRZEJECIE_S', '30'))
-# Klasy sprzętu, na których technika została sprawdzona na prawdziwym sprzęcie w ShamanWipe. Pusty do czasu testów.
-ZWERYFIKOWANE_NA_SPRZECIE = set()
+# Techniki (klucze METODY) sprawdzone w ShamanWipe na prawdziwym sprzęcie, z warunkiem sukcesu z tabeli decyzji spełnionym.
+# Per technika, nie per rodzina: sprawdzenie jednej techniki ATA nie świadczy o pozostałych.
+# ata-sanitize-block: Samsung PM871b za mostkiem USB–SATA (SAT) — stan Sanitize przed/w trakcie/po + 512/512 znaczników.
+ZWERYFIKOWANE_NA_SPRZECIE = {'ata-sanitize-block'}
 
 ZRODLO_KLASYFIKACJI = L('NIST SP 800-88r2 (wrzesień 2025) §3.1.1 Clear, §3.1.2 Purge, §3.2 Cryptographic Erase',
                         'NIST SP 800-88r2 (September 2025) §3.1.1 Clear, §3.1.2 Purge, §3.2 Cryptographic Erase')
@@ -109,7 +111,7 @@ UWAGA_CE = L('Cryptographic Erase: skuteczność zależy od implementacji (NIST 
 UWAGA_IEEE = L('klasa zależna od typu nośnika wg IEEE 2883 — normy nie sprawdzono (płatna)',
                'class depends on the media type per IEEE 2883 — the standard was not checked (paywalled)')
 
-# klucz -> (klasa, opis techniki, uwaga, rodzina sprzętu do ZWERYFIKOWANE_NA_SPRZECIE)
+# klucz -> (klasa, opis techniki, uwaga, rodzina sprzętu; 'host' = nadpis przez hosta, bez polecenia firmware)
 METODY = {
     'nvme-sanitize-crypto':    ('PURGE', 'NVMe Sanitize — Crypto Erase', UWAGA_CE, 'nvme'),
     'nvme-sanitize-block':     ('PURGE', 'NVMe Sanitize — Block Erase', UWAGA_IEEE, 'nvme'),
@@ -860,8 +862,8 @@ def uzupelnij_plan(plan, d):
         plan['klasa'] = 'NONE'
     plan['technika'] = ' → '.join(METODY[k][1] for k in kroki)
     plan['uwagi_metody'] = [METODY[k][2] for k in kroki if METODY[k][2]]
-    rodziny = {METODY[k][3] for k in kroki if METODY[k][3] != 'host'}
-    plan['niezweryfikowane_na_sprzecie'] = sorted(r for r in rodziny if r not in ZWERYFIKOWANE_NA_SPRZECIE)
+    plan['niezweryfikowane_na_sprzecie'] = sorted({k for k in kroki
+                                                   if METODY[k][3] != 'host' and k not in ZWERYFIKOWANE_NA_SPRZECIE})
     ost = kroki[-1] if kroki else ''
     plan['weryfikacja'] = (L('pełny odczyt — każdy bajt = 0x00', 'full read-back — every byte = 0x00')
                            if ost in ('overwrite-zeros', 'mmc-discard-sanitize')
@@ -1633,8 +1635,8 @@ def wiersz_dysku(z):
     d, p = z.d, z.d.get('plan', {})
     uwagi = p.get('uwagi', []) + p.get('uwagi_metody', [])
     if p.get('niezweryfikowane_na_sprzecie'):
-        uwagi.append(L('Technika niezweryfikowana w ShamanWipe na sprzęcie tej klasy (', 'Technique not yet verified in ShamanWipe '
-                       'on hardware of this class (') + ', '.join(p['niezweryfikowane_na_sprzecie']) + ')')
+        uwagi.append(L('Technika niezweryfikowana w ShamanWipe na prawdziwym sprzęcie (', 'Technique not yet verified in ShamanWipe '
+                       'on real hardware (') + ', '.join(p['niezweryfikowane_na_sprzecie']) + ')')
     if z.komunikat:
         uwagi.append(z.komunikat)
     w = z.weryfikacja or {}
