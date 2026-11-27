@@ -19,6 +19,7 @@ import argparse
 import contextlib
 import csv
 import datetime
+import errno
 import fcntl
 import glob
 import hashlib
@@ -92,6 +93,8 @@ MNT_RAPORTY = _env_test('SW_MNT_RAPORTY', '/mnt/sw-reports')
 # Celowo stałe i jawne, nie losowe: po przerwanym SE (np. zanik zasilania) dysk da się odblokować tym hasłem.
 ATA_HASLO = 'SHAMANWIPE'
 ROZMIAR_BLOKU_IO = 4 * 1024 * 1024
+MAKS_BLEDOW_ODCZYTU_W_RAPORCIE = 16   # pełny odczyt: szczegóły (offset, errno) pierwszych N błędów; liczba łączna zawsze
+MAKS_LINII_DZIENNIKA_JADRA = 20
 ROZMIAR_PROBKI = 64 * 1024
 LICZBA_PROBEK = 512
 ODLICZANIE_AUTOMAT_S = int(_env_test('SW_ODLICZANIE', '60'))
@@ -197,8 +200,9 @@ def log(msg, plik='run.log'):
             f.write(f'{teraz_iso()} {msg}\n')
 
 
-def uruchom(cmd, timeout=120, wejscie=None):
-    """Uruchamia polecenie (lista), zwraca (rc, stdout, stderr). Każde wywołanie trafia do commands.log."""
+def uruchom(cmd, timeout=120, wejscie=None, loguj_stdout=True):
+    """Uruchamia polecenie (lista), zwraca (rc, stdout, stderr). Każde wywołanie trafia do commands.log
+    (loguj_stdout=False: tylko długość stdout — np. dmesg z komunikatami o innych urządzeniach)."""
     t0 = time.time()
     try:
         p = subprocess.run(cmd, input=wejscie, capture_output=True, text=True, timeout=timeout, errors='replace',
@@ -209,7 +213,8 @@ def uruchom(cmd, timeout=120, wejscie=None):
         rc, err = 124, 'TIMEOUT'
     except FileNotFoundError:
         rc, out, err = 127, '', f'program not found: {cmd[0]}'
-    log(f'[{rc}] ({time.time() - t0:.1f}s) {" ".join(cmd)}\n--- stdout ---\n{out[-20000:]}\n--- stderr ---\n{err[-4000:]}',
+    wyjscie = out[-20000:] if loguj_stdout else f'({len(out)} chars, not logged)'
+    log(f'[{rc}] ({time.time() - t0:.1f}s) {" ".join(cmd)}\n--- stdout ---\n{wyjscie}\n--- stderr ---\n{err[-4000:]}',
         'commands.log')
     return rc, out, err
 
@@ -220,6 +225,36 @@ def czytaj(sciezka, domyslnie=''):
             return f.read().strip()
     except OSError:
         return domyslnie
+
+
+def zapisz_sysfs(sciezka, tresc):
+    """Zapis do pliku sysfs (np. /sys/power/mem_sleep). False przy błędzie, bez wyjątku."""
+    try:
+        with open(sciezka, 'w') as f:
+            f.write(tresc)
+        return True
+    except OSError:
+        return False
+
+
+def wycinek_dziennika_jadra(nazwa):
+    """Ostatnie linie dmesg o urządzeniu (nazwa jądra, np. „sdc”; dla „nvme0n1” także kontroler „nvme0”: timeout, reset)
+    — kontekst błędów odczytu do raportu. To tylko diagnostyka: każdy błąd (np. dmesg_restrict, brak programu) daje
+    pustą listę, nigdy wyjątek, żeby nie zgubić już zebranego wyniku weryfikacji."""
+    if not nazwa:
+        return []
+    nazwy = [nazwa]
+    m = re.fullmatch(r'(nvme\d+)n\d+', nazwa)
+    if m:
+        nazwy.append(m.group(1))
+    try:
+        rc, out, _ = uruchom(['dmesg'], timeout=30, loguj_stdout=False)
+    except Exception:  # noqa: BLE001 — diagnostyka nie może przerwać weryfikacji
+        return []
+    if rc != 0:
+        return []
+    wzor = re.compile(r'(?<!\w)(?:' + '|'.join(map(re.escape, nazwy)) + r')(?!\w)')
+    return [w.strip()[:300] for w in out.splitlines() if wzor.search(w)][-MAKS_LINII_DZIENNIKA_JADRA:]
 
 
 def czytelny_rozmiar(b):
@@ -1068,6 +1103,7 @@ class Zadanie:
         self.kroki = []
         self.start = self.koniec = None
         self.weryfikacja = None
+        self.dziennik_jadra = []     # linie dmesg o urządzeniu, gdy pełny odczyt trafił na błędy
         self.znaczniki_zgodne = None
         self.zapisane_b = 0
         self.watek = None
@@ -1341,10 +1377,12 @@ class Zadanie:
 
     def weryfikuj_zera(self):
         self.etap = L('weryfikacja (pełny odczyt)', 'verification (full read-back)')
+        nazwa_jadra = os.path.basename(os.path.realpath(self.d['sciezka']))  # PRZED odczytem: link by-id może zniknąć
         u = UrzadzenieBlokowe(self.d['sciezka'])
         buf = mmap.mmap(-1, ROZMIAR_BLOKU_IO)
         zero = bytes(ROZMIAR_BLOKU_IO)
         rozm, poz, niezerowe, bledy, t0, pierwszy = u.rozmiar, 0, 0, 0, time.time(), None
+        szczegoly, bajty_bledne = [], 0
         try:
             while poz < rozm:
                 dl = min(ROZMIAR_BLOKU_IO, rozm - poz)
@@ -1353,8 +1391,12 @@ class Zadanie:
                     if n != dl or buf[:n] != zero[:n]:
                         niezerowe += 1
                         pierwszy = poz if pierwszy is None else pierwszy
-                except OSError:
+                except OSError as e:
                     bledy += 1
+                    bajty_bledne += dl
+                    if len(szczegoly) < MAKS_BLEDOW_ODCZYTU_W_RAPORCIE:
+                        szczegoly.append({'offset': poz, 'dlugosc': dl, 'errno': e.errno,
+                                          'kod': errno.errorcode.get(e.errno, str(e.errno))})
                 poz += dl
                 dt = time.time() - t0
                 self.postep = round(poz * 100 / rozm, 1)
@@ -1362,9 +1404,18 @@ class Zadanie:
         finally:
             u.zamknij()
             buf.close()
-        return {'metoda': L('pełny odczyt, każdy bajt = 0x00', 'full read-back, every byte = 0x00'), 'zweryfikowane_b': poz, 'rozmiar_b': rozm,
-                'bloki_4MiB_niezerowe': niezerowe, 'bledy_odczytu': bledy, 'pierwszy_niezerowy_offset': pierwszy,
-                'zaliczona': niezerowe == 0 and bledy == 0 and poz >= rozm}
+        if bledy:
+            self.dziennik_jadra = wycinek_dziennika_jadra(nazwa_jadra)
+            try:  # dodatkowy zapis do run.log (np. ENOSPC) nie może zgubić zebranego wyniku odczytu
+                for w in self.dziennik_jadra:
+                    log(f'{self.d["nazwa"]}: kernel: {w}')
+            except OSError:
+                pass
+        # zweryfikowane_b = bajty faktycznie odczytane; bloki z błędem odczytu nie są zweryfikowane
+        return {'metoda': L('pełny odczyt, każdy bajt = 0x00', 'full read-back, every byte = 0x00'),
+                'zweryfikowane_b': poz - bajty_bledne, 'rozmiar_b': rozm,
+                'bloki_4MiB_niezerowe': niezerowe, 'bledy_odczytu': bledy, 'bledy_odczytu_szczegoly': szczegoly,
+                'pierwszy_niezerowy_offset': pierwszy, 'zaliczona': niezerowe == 0 and bledy == 0 and poz >= rozm}
 
     def weryfikuj_znaczniki(self, znaczniki):
         self.etap = L('weryfikacja (znaczniki)', 'verification (markers)')
@@ -1517,17 +1568,40 @@ def ustal_status(z):
 
 
 def odmroz_dyski(zadania):
-    """Uśpienie S3 na kilka sekund PRZED pierwszą operacją niszczącą. Po wybudzeniu: ponowna kontrola stanu i tożsamości."""
+    """Uśpienie na kilka sekund PRZED pierwszą operacją niszczącą (deep/S3, gdy jądro go oferuje).
+    Po wybudzeniu: ponowna kontrola stanu i tożsamości."""
     do = [z for z in zadania if 'unfreeze' in z.d['plan']['przygotowanie']]
     if not do:
         return
     stany = czytaj('/sys/power/state')
-    log(f'unfreeze: {", ".join(z.d["nazwa"] for z in do)}; /sys/power/state="{stany}" mem_sleep="{czytaj("/sys/power/mem_sleep")}"')
+    tryby = czytaj('/sys/power/mem_sleep')  # np. "[s2idle] deep" — w nawiasie tryb wybrany
+    log(f'unfreeze: {", ".join(z.d["nazwa"] for z in do)}; /sys/power/state="{stany}" mem_sleep="{tryby}"')
+    tryb = rc_rtc = None
     if 'mem' in stany:
+        # s2idle nie odmroził dysku na żelazie (G8, 26.11: Dell OptiPlex 5480 AIO, "[s2idle] deep"); deep (S3) wyłącza
+        # zasilanie dysków, a BIOS przy wybudzeniu zwykle nie mrozi ich ponownie. Wybór na czas uśpienia, potem powrót.
+        m = re.search(r'\[(\S+)\]', tryby)
+        biezacy = m.group(1) if m else None
+        tryb, przelaczony, rc_rtc = biezacy, False, None
+        # komunikat PRZED zmianą mem_sleep: zamknięty stdout (SIGPIPE) nie może przerwać procesu z ustawionym „deep”
         print(L('Usypiam komputer na ~5 s, żeby odmrozić dyski (frozen). Jeśli sam się nie obudzi — naciśnij zasilanie.',
-                'Suspending the computer for ~5 s to unfreeze the drives. If it does not wake up by itself, press the power button.'))
-        uruchom(['rtcwake', '-m', 'mem', '-s', '5'], timeout=180)
-        time.sleep(8)
+                'Suspending the computer for ~5 s to unfreeze the drives. If it does not wake up by itself, press the power button.'),
+              flush=True)
+        try:  # od pierwszego zapisu do sysfs: cokolwiek się stanie, poprzedni tryb ma wrócić
+            if biezacy and biezacy != 'deep' and 'deep' in tryby.split():
+                przelaczony = zapisz_sysfs('/sys/power/mem_sleep', 'deep')
+                tryb = 'deep' if przelaczony else biezacy
+                log(f'unfreeze: mem_sleep {biezacy} -> deep: {"ok" if przelaczony else "write failed"}')
+            rc_rtc = uruchom(['rtcwake', '-m', 'mem', '-s', '5'], timeout=180)[0]
+            time.sleep(8)
+        finally:
+            if przelaczony:
+                ok = zapisz_sysfs('/sys/power/mem_sleep', biezacy)
+                log(f'unfreeze: mem_sleep restored to {biezacy}: {"ok" if ok else "write failed"}')
+    # tryb = tryb, w którym PRÓBOWANO uśpić; rc rtcwake ≠ 0 (124 timeout, 127 brak programu) = uśpienia mogło nie być.
+    # O Security Erase i tak decyduje świeży IDENTIFY poniżej, nie ten opis.
+    opis_trybu = (f' ({L("uśpienie", "sleep")}: {tryb or L("brak", "none")}'
+                  + (f', rtcwake rc={rc_rtc}' if rc_rtc else '') + ')')
     for z in zadania:  # po uśpieniu nazwy urządzeń mogą się przetasować — kontrola tożsamości WSZYSTKICH
         if not zgodna_tozsamosc(z.d['tozsamosc'], odczytaj_tozsamosc(z.d)):
             z.d['plan']['mozliwe'] = False
@@ -1539,7 +1613,8 @@ def odmroz_dyski(zadania):
         if a:
             z.d['ata']['bezpieczenstwo'] = a['bezpieczenstwo']
         zamr = z.d['ata']['bezpieczenstwo'].get('zamrozone')
-        z.d['plan']['odmrozenie_wynik'] = L('odmrożony', 'unfrozen') if zamr is False else L('nadal zamrożony', 'still frozen')
+        z.d['plan']['odmrozenie_tryb'] = tryb
+        z.d['plan']['odmrozenie_wynik'] = (L('odmrożony', 'unfrozen') if zamr is False else L('nadal zamrożony', 'still frozen')) + opis_trybu
         if zamr is not False:  # nieznany stan po uśpieniu traktowany jak „nadal zamrożony”
             stare = list(z.d['plan']['kroki'])
             nowe = [k for k in z.d['plan']['zapasowe'] if not k.startswith('ata-se')]
@@ -1648,7 +1723,7 @@ def wiersz_dysku(z):
             'rozmiar_identify_b': d.get('rozmiar_identify_b'), 'rozmiar_urzadzenia_b': d.get('rozmiar_urzadzenia_b') or d.get('rozmiar_b'),
             'zapisane_b': z.zapisane_b or None, 'zweryfikowane_b': w.get('zweryfikowane_b'),
             'metoda_nist': p.get('klasa', 'NONE'), 'technika': p.get('technika'), 'klasyfikacja_zrodlo': ZRODLO_KLASYFIKACJI,
-            'odmrozenie': p.get('odmrozenie_wynik'), 'weryfikacja': z.weryfikacja,
+            'odmrozenie': p.get('odmrozenie_wynik'), 'weryfikacja': z.weryfikacja, 'dziennik_jadra': z.dziennik_jadra,
             'status': z.status, 'zastrzezenia': z.zastrzezenia, 'niepotwierdzone': z.niepotwierdzone, 'uwagi': uwagi,
             'start': z.start, 'koniec': z.koniec, 'kroki': z.kroki,
             'smart_przed': {k: d.get('smart_przed', {}).get(k) for k in POLA_SMART},
@@ -1672,6 +1747,7 @@ KLUCZE_RAPORTU = {
     'uwagi': 'notes', 'koniec': 'end', 'kroki': 'steps', 'smart_przed': 'smart_before', 'smart_po': 'smart_after',
     'powod': 'reason', 'metoda': 'method', 'rozmiar_b': 'size_bytes', 'bloki_4MiB_niezerowe': 'nonzero_4mib_blocks',
     'bledy_odczytu': 'read_errors', 'pierwszy_niezerowy_offset': 'first_nonzero_offset', 'zaliczona': 'passed',
+    'bledy_odczytu_szczegoly': 'read_error_details', 'dlugosc': 'length', 'kod': 'code', 'dziennik_jadra': 'kernel_log',
     'probek': 'samples', 'zmienione_lub_jednolite': 'changed_or_uniform',
     'identyczne_jak_przed_niejednolite': 'unchanged_nonuniform', 'nierozstrzygniete': 'inconclusive',
     'sygnatury_po': 'signatures_after', 'nazwa': 'name', 'opis': 'detail', 'czas': 'time', 'bledy': 'errors',
@@ -1680,7 +1756,7 @@ KLUCZE_RAPORTU = {
     'temperatura': 'temperature', 'podpisany': 'signed', 'odcisk_klucza': 'key_fingerprint', 'stan': 'state',
 }
 KLUCZE_STALE = {'id', 'program', 'operator', 'system', 'model', 'uuid', 'firmware', 'wwn', 'status', 'start', 'rc', 'sstat',
-                'name', 'title', 'organization', 'location', 'contact'}
+                'name', 'title', 'organization', 'location', 'contact', 'offset', 'errno'}
 DANE_BEZ_ZMIAN = {'narzedzia', 'podsumowanie'}
 
 
@@ -1811,12 +1887,13 @@ def pisz_pdf(sciezka, raport):
                        (L('Pojemność', 'Capacity'),
                         L(f'IDENTIFY: {d["rozmiar_identify_b"] or "—"} B; urządzenie: {d["rozmiar_urzadzenia_b"]} B '
                           f'({czytelny_rozmiar(d["rozmiar_urzadzenia_b"])}); zapisane: {d["zapisane_b"] or "—"} B; '
-                          f'zweryfikowane: {d["zweryfikowane_b"] or "—"} B',
+                          f'zweryfikowane: {"—" if d["zweryfikowane_b"] is None else d["zweryfikowane_b"]} B',
                           f'IDENTIFY: {d["rozmiar_identify_b"] or "—"} B; device: {d["rozmiar_urzadzenia_b"]} B '
                           f'({czytelny_rozmiar(d["rozmiar_urzadzenia_b"])}); written: {d["zapisane_b"] or "—"} B; '
-                          f'verified: {d["zweryfikowane_b"] or "—"} B')),
+                          f'verified: {"—" if d["zweryfikowane_b"] is None else d["zweryfikowane_b"]} B')),
                        (L('Zawartość przed (sygnatury)', 'Content before (signatures)'), ', '.join(d['zawartosc_przed'] or []) or L('brak', 'none')),
                        (L('Metoda (NIST)', 'Method (NIST)'), kod(d['metoda_nist'])), (L('Technika wykonana', 'Technique performed'), d['technika']),
+                       (L('Odmrożenie (frozen)', 'Unfreeze (frozen)'), d.get('odmrozenie') or '—'),
                        (L('Podstawa klasyfikacji', 'Classification basis'), d['klasyfikacja_zrodlo']),
                        (L('Narzędzie', 'Tool'), f'{raport["program"]}; ' + ', '.join(f'{k} {v}' for k, v in s['narzedzia'].items()
                                                                                     if k in ('hdparm', 'nvme-cli', 'openseachest'))),

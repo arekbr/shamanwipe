@@ -56,6 +56,21 @@ MUTACJE = [
     ('sprawdzenie na sprzęcie per rodzina: cała rodzina ata uznana za sprawdzoną (SE bez adnotacji)',
      "if METODY[k][3] != 'host' and k not in ZWERYFIKOWANE_NA_SPRZECIE})",
      "if METODY[k][3] not in ('host', 'ata')})"),
+    ('odmrażanie: tryb deep nigdy nie wybierany (uśpienie zostaje w s2idle)',
+     "        if biezacy and biezacy != 'deep' and 'deep' in tryby.split():",
+     "        if False:"),
+    ('odmrażanie: poprzedni tryb uśpienia nie wraca po wybudzeniu',
+     "            if przelaczony:\n                ok = zapisz_sysfs",
+     "            if False:\n                ok = zapisz_sysfs"),
+    ('pełny odczyt: offset błędu odczytu nie trafia do raportu',
+     "szczegoly.append({'offset': poz,",
+     "szczegoly.append({'offset': None,"),
+    ('odmrażanie: niezerowy kod rtcwake nie trafia do raportu',
+     "+ (f', rtcwake rc={rc_rtc}' if rc_rtc else '')",
+     "+ ''"),
+    ('pełny odczyt: wyjątek przy uruchamianiu dmesg przerywa weryfikację (gubi szczegóły błędów)',
+     "    except Exception:  # noqa: BLE001 — diagnostyka nie może przerwać weryfikacji\n        return []",
+     "    except ZeroDivisionError:\n        return []"),
 ]
 
 

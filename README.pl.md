@@ -8,7 +8,7 @@ które wykonuje.
 
 Polski · [English](README.md)
 
-> Stan: **0.1.0, wczesne wydanie.** Cały przebieg jest przetestowany w kontenerach i w QEMU (BIOS i UEFI, płyta
+> Stan: **0.1.1, wczesne wydanie.** Cały przebieg jest przetestowany w kontenerach i w QEMU (BIOS i UEFI, płyta
 > i USB). Polecenia kasowania w firmware są tak dobre, jak firmware dysku. Na prawdziwym sprzęcie sprawdzona została
 > dotąd jedna technika: ATA SANITIZE BLOCK ERASE na dysku SSD SATA Samsung PM871b za mostkiem USB–SATA (dysk zgłosił
 > zakończenie operacji bez błędu, a żaden z 512 znaczników nie przetrwał). Gdy technika podana w raporcie to dowolna
@@ -23,14 +23,19 @@ Polski · [English](README.md)
   nadpis przez hosta. Kilka dysków kasuje równolegle.
 - **Najpierw przygotowuje dysk.** Ukryte obszary (HPA/DCO) wykrywa i przed kasowaniem przywraca pełną pojemność.
   Gdy przywrócenie się nie uda, wolno użyć wyłącznie metod firmware (nadpis przez hosta ominąłby ukryty obszar);
-  gdy i one zawiodą, dysk kończy jako `FAILED`. Dysk ATA w stanie „frozen” odmraża krótkim uśpieniem komputera,
-  gdy planowaną metodą jest Security Erase, a komputer obsługuje uśpienie do RAM. Security Erase rusza dopiero
+  gdy i one zawiodą, dysk kończy jako `FAILED`. Dysk ATA w stanie „frozen” program próbuje odmrozić krótkim uśpieniem
+  komputera, gdy planowaną metodą jest Security Erase, a jądro oferuje uśpienie (`mem`); dysk może pozostać
+  zamrożony. Jeśli jądro oferuje tryb deep (S3), program próbuje uśpić komputer w tym trybie, bo uśpienie s2idle
+  zostawiło dysk zamrożony na prawdziwym sprzęcie, a potem próbuje przywrócić poprzedni tryb. Raport podaje tryb,
+  w którym próbowano uśpić komputer, i niezerowy kod wyniku próby `rtcwake`. Security Erase rusza dopiero
   wtedy, gdy świeży IDENTIFY, odczytany tuż przed nim, potwierdzi „not frozen” — także gdy SE jest tylko rezerwą;
   dysk zamrożony, brak tej flagi albo nieudany odczyt oznaczają, że SE jest pomijany.
 - **Sprawdza wynik, zamiast ufać kodowi wyjścia.** Przed kasowaniem sprzętowym (poza eMMC) zapisuje 512 losowych
   znaczników po 64 KiB rozłożonych po całym dysku; po kasowaniu każdy musi zniknąć, a na dysku nie może zostać
   sygnatura systemu plików. Nadpis i procedura eMMC kończą się odczytem całego dysku (każdy bajt = 0x00). Dane,
-  które przetrwały — znacznik na miejscu, niezerowy blok — zawsze dają `FAILED`.
+  które przetrwały — znacznik na miejscu, niezerowy blok — zawsze dają `FAILED`. Błędy odczytu podczas pełnego
+  odczytu raport JSON i XML wymienia z offsetem i kodem błędu (pierwsze 16), razem z liniami dziennika jądra o tym
+  dysku, jeśli dziennik jądra da się odczytać.
 - **Uczciwie klasyfikuje** wg NIST SP 800-88r2 (wrzesień 2025): `PURGE` tylko dla poleceń sanitize i kasowania
   kryptograficznego, `CLEAR` dla nadpisu, ATA Security Erase i NVMe Format bez kasowania kryptograficznego, `NONE`
   dla mostka USB, który nie przekazuje ani poleceń ATA, ani SCSI Sanitize, i dla wolumenów RAID sprzętowego. Klasa opisuje technikę; to, czy wynik

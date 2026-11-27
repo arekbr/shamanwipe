@@ -3,12 +3,15 @@
 Uruchomienie:  SW_LANG=en python3 -I tests/test_dobor.py  i  SW_LANG=pl …  (dobór nie zależy od języka)      (SW_SRC=<plik> podmienia testowany program — używa tego tests/mutacje.sh)
 Nic nie mutuje; czyste funkcje na danych z tests/fixtures/.
 """
+import errno
 import importlib.machinery
 import importlib.util
 import json
 import os
 import pathlib
 import sys
+import time
+import types
 import unittest
 
 TU = pathlib.Path(__file__).resolve().parent
@@ -418,9 +421,204 @@ class SprawdzoneNaSprzecie(unittest.TestCase):
         d['plan'] = self.plan(d)
         z = Z(d)
         z.komunikat = z.weryfikacja = z.zapisane_b = z.status = z.start = z.koniec = None
-        z.kroki = []
+        z.kroki, z.dziennik_jadra = [], []
         uwagi = sw.wiersz_dysku(z)['uwagi']
         self.assertTrue([u for u in uwagi if u.endswith('(ata-se-enhanced)')], uwagi)
+
+
+class UspienieDeep(unittest.TestCase):
+    """Odmrażanie: tryb deep (S3) wybierany na czas uśpienia, gdy jądro go oferuje; poprzedni tryb zawsze wraca."""
+
+    def setUp(self):
+        self.stare = {n: getattr(sw, n) for n in ('uruchom', 'log', 'czytaj', 'zapisz_sysfs', 'odczytaj_tozsamosc',
+                                                  'zgodna_tozsamosc', 'time')}
+        self.state, self.mem_sleep, self.zapis_ok, self.rtc_wyjatek, self.ident = 'freeze mem', '[s2idle] deep', True, False, None
+        self.rtc_rc, self.log_wyjatek = 0, False
+        self.zdarzenia = []
+        sw.czytaj = lambda p, *a, **k: {'/sys/power/state': self.state, '/sys/power/mem_sleep': self.mem_sleep}.get(p, '')
+        sw.zapisz_sysfs = lambda p, t: (self.zdarzenia.append(('zapis', p, t)), self.zapis_ok)[1]
+
+        def log(tekst, *a, **k):
+            if self.log_wyjatek and '-> deep' in tekst:
+                raise RuntimeError('log po przełączeniu')
+        sw.log = log
+        sw.odczytaj_tozsamosc = lambda d: {}
+        sw.zgodna_tozsamosc = lambda a, b: True
+        sw.time = types.SimpleNamespace(sleep=lambda s: None, time=time.time)
+
+        def uruchom(cmd, **k):
+            if cmd[0] == 'rtcwake':
+                self.zdarzenia.append(('rtcwake',))
+                if self.rtc_wyjatek:
+                    raise RuntimeError('rtcwake')
+                return self.rtc_rc, '', ''
+            if cmd[:2] == ['hdparm', '-I'] and self.ident:
+                return 0, self.ident, ''
+            return 1, '', ''
+        sw.uruchom = uruchom
+        self.d = dysk_ata('syntetyczny-hdparm-ssd-frozen.txt', tozsamosc={})
+        self.d['plan'] = sw.wybierz_metode(self.d, 'standard')
+        self.assertIn('unfreeze', self.d['plan']['przygotowanie'])  # kontrola: ten dysk naprawdę wymaga odmrożenia
+
+    def tearDown(self):
+        for n, f in self.stare.items():
+            setattr(sw, n, f)
+
+    ZAPIS = ('zapis', '/sys/power/mem_sleep')
+
+    def test_s2idle_przelacza_na_deep_i_przywraca(self):
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [self.ZAPIS + ('deep',), ('rtcwake',), self.ZAPIS + ('s2idle',)])
+        self.assertEqual(self.d['plan']['odmrozenie_tryb'], 'deep')
+        self.assertIn('deep', self.d['plan']['odmrozenie_wynik'])
+
+    def test_bez_deep_bez_zapisu(self):
+        self.mem_sleep = '[s2idle]'
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [('rtcwake',)])
+        self.assertEqual(self.d['plan']['odmrozenie_tryb'], 's2idle')
+
+    def test_deep_juz_wybrany_bez_zapisu(self):
+        self.mem_sleep = 's2idle [deep]'
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [('rtcwake',)])
+        self.assertEqual(self.d['plan']['odmrozenie_tryb'], 'deep')
+
+    def test_nieudany_zapis_uspienie_w_biezacym_trybie(self):
+        self.zapis_ok = False
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [self.ZAPIS + ('deep',), ('rtcwake',)])  # nic do przywracania
+        self.assertEqual(self.d['plan']['odmrozenie_tryb'], 's2idle')
+
+    def test_blad_rtcwake_tryb_i_tak_przywrocony(self):
+        self.rtc_wyjatek = True
+        with self.assertRaises(RuntimeError):
+            sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia[-1], self.ZAPIS + ('s2idle',))
+
+    def test_wyjatek_tuz_po_przelaczeniu_tryb_wraca(self):  # try/finally obejmuje już sam zapis „deep”
+        self.log_wyjatek = True
+        with self.assertRaises(RuntimeError):
+            sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [self.ZAPIS + ('deep',), self.ZAPIS + ('s2idle',)])
+
+    def test_rtcwake_niezerowy_kod_w_raporcie(self):  # 124 = timeout: uśpienia mogło nie być — raport to mówi
+        self.rtc_rc = 124
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertIn('rtcwake rc=124', self.d['plan']['odmrozenie_wynik'])
+        self.rtc_rc = 0
+        self.d['plan'] = sw.wybierz_metode(self.d, 'standard')
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertNotIn('rtcwake rc', self.d['plan']['odmrozenie_wynik'])
+
+    def test_brak_uspienia_w_jadrze(self):
+        self.state = 'freeze'
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertEqual(self.zdarzenia, [])
+        self.assertIsNone(self.d['plan']['odmrozenie_tryb'])
+        self.assertIn(sw.L('brak', 'none'), self.d['plan']['odmrozenie_wynik'])
+
+    def test_odmrozony_po_deep_zostawia_security_erase(self):
+        self.ident = fx('hdparm-samsung-pm871-0.txt')  # świeży IDENTIFY: not frozen
+        sw.odmroz_dyski([Z(self.d)])
+        self.assertTrue(self.d['plan']['odmrozenie_wynik'].startswith(sw.L('odmrożony', 'unfrozen')))
+        self.assertTrue(any(k.startswith('ata-se') for k in self.d['plan']['kroki'] + self.d['plan']['zapasowe']))
+
+
+class PelnyOdczytBledy(unittest.TestCase):
+    """Pełny odczyt: błąd odczytu zostawia offset, długość, errno i kod; do raportu idzie wycinek dmesg o tym urządzeniu."""
+    B = sw.ROZMIAR_BLOKU_IO
+    DMESG = '\n'.join([
+        '[   12.3] sd 2:0:0:0: [sdc] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_OK',
+        '[   12.4] I/O error, dev sdc, sector 16384 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2',
+        '[   12.5] usb 2-1: reset high-speed USB device number 3 using xhci_hcd',
+        '[   12.6] I/O error, dev sdb, sector 8 op 0x0:(READ)',
+        '[   12.7] EXT4-fs (sdc1): mounted filesystem'])
+
+    def setUp(self):
+        self.stare = {n: getattr(sw, n) for n in ('UrzadzenieBlokowe', 'uruchom', 'log')}
+        self.polecenia = []
+        test = self
+
+        class Falszywe:
+            def __init__(self, sciezka):
+                self.rozmiar = test.bloki * test.B
+
+            def czytaj(self, buf, poz, dl):
+                if poz // test.B in test.zle:
+                    raise OSError(errno.EIO, 'Input/output error')
+                buf[:dl] = bytes(dl)
+                return dl
+
+            def zamknij(self):
+                pass
+        sw.UrzadzenieBlokowe = Falszywe
+        sw.uruchom = lambda cmd, **k: (self.polecenia.append(cmd), (0, self.DMESG, ''))[1]
+        sw.log = lambda *a, **k: None
+        self.z = sw.Zadanie({'sciezka': '/dev/sdc', 'nazwa': 'sdc'}, 'standard')
+
+    def tearDown(self):
+        for n, f in self.stare.items():
+            setattr(sw, n, f)
+
+    def test_offset_errno_i_dziennik_jadra(self):
+        self.bloki, self.zle = 10, {2, 7}
+        w = self.z.weryfikuj_zera()
+        self.assertFalse(w['zaliczona'])
+        self.assertEqual(w['bledy_odczytu'], 2)
+        self.assertEqual(w['bledy_odczytu_szczegoly'],
+                         [{'offset': 2 * self.B, 'dlugosc': self.B, 'errno': errno.EIO, 'kod': 'EIO'},
+                          {'offset': 7 * self.B, 'dlugosc': self.B, 'errno': errno.EIO, 'kod': 'EIO'}])
+        self.assertEqual(self.z.dziennik_jadra, self.DMESG.splitlines()[:2])  # tylko sdc, bez sdb i sdc1
+        self.assertEqual(w['zweryfikowane_b'], 8 * self.B)  # 2 bloki z błędem nie są zweryfikowane
+
+    def test_wyjatek_dmesg_nie_gubi_szczegolow(self):  # np. PermissionError przy uruchamianiu procesu
+        def uruchom(cmd, **k):
+            raise PermissionError(errno.EPERM, 'dmesg')
+        sw.uruchom = uruchom
+        self.bloki, self.zle = 4, {1}
+        w = self.z.weryfikuj_zera()
+        self.assertEqual([s['offset'] for s in w['bledy_odczytu_szczegoly']], [self.B])
+        self.assertEqual(self.z.dziennik_jadra, [])
+
+    def test_pelny_run_log_nie_gubi_szczegolow(self):  # ENOSPC przy dopisywaniu linii jądra do run.log
+        def log(tekst, *a, **k):
+            if 'kernel:' in tekst:
+                raise OSError(errno.ENOSPC, 'No space left on device')
+        sw.log = log
+        self.bloki, self.zle = 3, {0}
+        w = self.z.weryfikuj_zera()
+        self.assertEqual([s['kod'] for s in w['bledy_odczytu_szczegoly']], ['EIO'])
+        self.assertEqual(len(self.z.dziennik_jadra), 2)
+
+    def test_nvme_takze_komunikaty_kontrolera(self):
+        sw.uruchom = lambda cmd, **k: (0, '\n'.join(['[ 1.0] nvme nvme0: I/O 7 QID 2 timeout, reset controller',
+                                                    '[ 1.1] I/O error, dev nvme0n1, sector 0 op 0x0:(READ)',
+                                                    '[ 1.2] nvme nvme1: I/O 9 QID 1 timeout',
+                                                    '[ 1.3] nvme0n1p1: something']), '')
+        self.z = sw.Zadanie({'sciezka': '/dev/nvme0n1', 'nazwa': 'nvme0n1'}, 'standard')
+        self.bloki, self.zle = 2, {0}
+        self.z.weryfikuj_zera()
+        self.assertEqual([w[:6] for w in self.z.dziennik_jadra], ['[ 1.0]', '[ 1.1]'])
+
+    def test_limit_szczegolow_liczba_laczna_pelna(self):
+        self.bloki, self.zle = 20, set(range(20))
+        w = self.z.weryfikuj_zera()
+        self.assertEqual(w['bledy_odczytu'], 20)
+        self.assertEqual(len(w['bledy_odczytu_szczegoly']), sw.MAKS_BLEDOW_ODCZYTU_W_RAPORCIE)
+
+    def test_bez_bledow_bez_dmesg(self):
+        self.bloki, self.zle = 3, set()
+        w = self.z.weryfikuj_zera()
+        self.assertTrue(w['zaliczona'])
+        self.assertEqual((w['bledy_odczytu_szczegoly'], self.z.dziennik_jadra, self.polecenia), ([], [], []))
+
+    def test_klucze_eksportu_po_angielsku(self):
+        r = sw.raport_eksport({'dziennik_jadra': ['x'], 'weryfikacja': {'bledy_odczytu_szczegoly': [
+            {'offset': 1, 'dlugosc': 2, 'errno': 5, 'kod': 'EIO'}]}})
+        self.assertEqual(r, {'kernel_log': ['x'], 'verification': {'read_error_details': [
+            {'offset': 1, 'length': 2, 'errno': 5, 'code': 'EIO'}]}})
+        self.assertEqual(sw.klucze_spoza_schematu(r), [])  # kontrola schematu przyjmuje nowe klucze
 
 
 class Drobne(unittest.TestCase):

@@ -8,7 +8,7 @@ erasure it performs.
 
 [Polski](README.pl.md) · English
 
-> Status: **0.1.0, early release.** The whole flow is tested in containers and in QEMU (BIOS and UEFI, CD and USB).
+> Status: **0.1.1, early release.** The whole flow is tested in containers and in QEMU (BIOS and UEFI, CD and USB).
 > Firmware erase commands are only as good as the drive firmware. On real hardware one technique has been verified
 > so far: ATA SANITIZE BLOCK ERASE, on a Samsung PM871b SATA SSD behind a USB–SATA bridge (the drive reported the
 > sanitize operation as completed without error, and none of the 512 markers survived). When the technique listed
@@ -23,14 +23,19 @@ erasure it performs.
   overwrite as the last resort. Several disks are erased in parallel.
 - **Prepares the drive first.** Hidden areas (HPA/DCO) are detected and the full capacity is restored before
   erasure. If restoring fails, only firmware methods may run (a host overwrite would miss the hidden area); if they
-  fail too, the disk ends as `FAILED`. A "frozen" ATA drive is suspended briefly to unfreeze it when Security Erase
-  is the planned method and the computer supports suspend-to-RAM. Security Erase starts only after a fresh
+  fail too, the disk ends as `FAILED`. ShamanWipe tries to unfreeze a "frozen" ATA drive by suspending the computer
+  briefly when Security Erase is the planned method and the kernel offers suspend (`mem`); the drive may stay
+  frozen. It tries deep sleep (S3) for that moment when the kernel offers it, because suspend-to-idle left a drive
+  frozen on real hardware, and then tries to restore the previous mode. The report records the sleep mode tried and
+  a non-zero status of the `rtcwake` attempt. Security Erase starts only after a fresh
   IDENTIFY, read right before it, confirms "not frozen" — also when it is only a fallback; a frozen drive, a
   missing flag or a failed read means it is skipped.
 - **Checks the result instead of trusting the exit code.** Before a firmware erase (except on eMMC) it writes 512
   random 64 KiB markers spread across the disk; every one of them must be gone afterwards, and the disk must carry
   no filesystem signatures. An overwrite and the eMMC procedure end with a full read-back (every byte must be
-  0x00). Data that survived — a marker still in place, a non-zero block — always makes the result `FAILED`.
+  0x00). Data that survived — a marker still in place, a non-zero block — always makes the result `FAILED`. Read
+  errors during the full read-back are listed in the JSON and XML report with their offset and error code (the
+  first 16), together with the kernel log lines about that disk when the kernel log can be read.
 - **Classifies honestly** per NIST SP 800-88r2 (September 2025): `PURGE` only for dedicated sanitize commands and
   cryptographic erase, `CLEAR` for overwrite, ATA Security Erase and NVMe Format without crypto erase, `NONE` for a
   USB bridge that passes neither ATA nor SCSI Sanitize commands and for hardware RAID volumes. The class describes the technique; whether the
